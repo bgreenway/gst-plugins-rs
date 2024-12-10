@@ -672,6 +672,9 @@ impl ObjectImpl for FallbackSrc {
                         false
                     })
                     .build(),
+                glib::subclass::Signal::builder("source-activated")
+                    .param_types([i32::static_type()])
+                    .build(),                    
                 glib::subclass::Signal::builder("unblock")
                     .action()
                     .class_handler(|_token, args| {
@@ -948,25 +951,22 @@ impl FallbackSrc {
         bin
     }
 
-    fn create_dummy_video_source(filter_caps: &gst::Caps, min_latency: gst::ClockTime) -> gst::Bin {
+    fn create_dummy_video_source(filter_caps: &gst::Caps, _min_latency: gst::ClockTime) -> gst::Bin {
         let bin = gst::Bin::default();
 
-        let videotestsrc = gst::ElementFactory::make("videotestsrc")
+        let videotestsrc = gst::ElementFactory::make("nvvideotestsrc")
             .name("videosrc")
-            .property_from_str("pattern", "black")
+            .property_from_str("pattern", "gradient")
+            .property_from_str("animation-mode", "running-time")
+            .property("do-timestamp", false)
             .property("is-live", true)
             .build()
             .expect("No videotestsrc found");
 
-        let videoconvert = gst::ElementFactory::make("videoconvert")
+        let videoconvert = gst::ElementFactory::make("nvvideoconvert")
             .name("video_videoconvert")
             .build()
             .expect("No videoconvert found");
-
-        let videoscale = gst::ElementFactory::make("videoscale")
-            .name("video_videoscale")
-            .build()
-            .expect("No videoscale found");
 
         let capsfilter = gst::ElementFactory::make("capsfilter")
             .name("video_capsfilter")
@@ -974,32 +974,21 @@ impl FallbackSrc {
             .build()
             .expect("No capsfilter found");
 
-        let queue = gst::ElementFactory::make("queue")
-            .property("max-size-bytes", 0u32)
-            .property("max-size-buffers", 0u32)
-            .property("max-size-time", cmp::max(min_latency, 1.seconds()))
-            .build()
-            .expect("No queue found");
-
         bin.add_many([
             &videotestsrc,
             &videoconvert,
-            &videoscale,
-            &capsfilter,
-            &queue,
+            &capsfilter
         ])
         .unwrap();
 
         gst::Element::link_many([
             &videotestsrc,
             &videoconvert,
-            &videoscale,
             &capsfilter,
-            &queue,
         ])
         .unwrap();
 
-        let ghostpad = gst::GhostPad::with_target(&queue.static_pad("src").unwrap()).unwrap();
+        let ghostpad = gst::GhostPad::with_target(&capsfilter.static_pad("src").unwrap()).unwrap();
         ghostpad.set_active(true).unwrap();
         bin.add_pad(&ghostpad).unwrap();
 
@@ -3459,6 +3448,9 @@ impl FallbackSrc {
             if state.source.restart_timeout.is_none() {
                 self.schedule_source_restart_timeout(state, gst::ClockTime::ZERO, false);
             }
+            self
+            .obj()
+            .emit_by_name::<()>("source-activated", &[&0i32]);            
         } else {
             gst::debug!(
                 CAT,
@@ -3475,6 +3467,9 @@ impl FallbackSrc {
                 gst::debug!(CAT, imp = self, "Unscheduling restart timeout");
                 timeout.unschedule();
             }
+            self
+            .obj()
+            .emit_by_name::<()>("source-activated", &[&1i32]);            
         }
 
         drop(state_guard);
