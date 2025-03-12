@@ -20,7 +20,7 @@ use std::ops::Bound::Excluded;
 use std::sync::Mutex;
 
 use crate::fmp4mux::obu::read_seq_header_obu_bytes;
-use crate::fmp4mux::ImageOrientation;
+use crate::fmp4mux::TransformMatrix;
 use std::sync::LazyLock;
 
 use super::boxes;
@@ -255,6 +255,12 @@ struct Stream {
     /// Current end PTS of the whole stream
     end_pts: Option<gst::ClockTime>,
 
+    /// Language code from tags
+    language_code: Option<[u8; 3]>,
+    /// Orientation from tags, stream orientation takes precedence over global orientation
+    global_orientation: &'static TransformMatrix,
+    stream_orientation: Option<&'static TransformMatrix>,
+
     /// Edit list entries for this stream.
     elst_infos: Vec<super::ElstInfo>,
 }
@@ -335,6 +341,31 @@ impl Stream {
     fn caps_or_tag_change(&self) -> bool {
         self.next_caps.is_some() || self.tag_changed
     }
+
+    fn flush(&mut self) {
+        self.queued_gops.clear();
+        self.dts_offset = None;
+        self.current_position = gst::ClockTime::ZERO;
+        self.fragment_filled = false;
+        self.pre_queue.clear();
+        self.running_time_utc_time_mapping = None;
+    }
+
+    fn orientation(&self) -> &'static TransformMatrix {
+        self.stream_orientation.unwrap_or(self.global_orientation)
+    }
+
+    fn parse_language_code(lang: &str) -> Option<[u8; 3]> {
+        if lang.len() == 3 && lang.chars().all(|c| c.is_ascii_lowercase()) {
+            let mut language_code: [u8; 3] = [0; 3];
+            for (out, c) in Iterator::zip(language_code.iter_mut(), lang.chars()) {
+                *out = c as u8;
+            }
+            Some(language_code)
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Default)]
@@ -365,10 +396,6 @@ struct State {
     end_pts: Option<gst::ClockTime>,
     /// Start DTS of the whole stream
     start_dts: Option<gst::ClockTime>,
-    /// Language code from tags
-    language_code: Option<[u8; 3]>,
-    /// Orientation from tags
-    orientation: Option<ImageOrientation>,
 
     /// Start PTS of the current fragment
     fragment_start_pts: Option<gst::ClockTime>,
@@ -387,6 +414,25 @@ struct State {
 
     /// Manually requested fragment boundaries
     manual_fragment_boundaries: BTreeSet<gst::ClockTime>,
+}
+
+impl State {
+    fn flush(&mut self) {
+        for stream in &mut self.streams {
+            stream.flush();
+        }
+
+        self.current_offset = 0;
+        self.fragment_offsets.clear();
+        self.manual_fragment_boundaries.clear();
+        self.end_pts = None;
+        self.fragment_start_pts = None;
+        self.fragment_end_pts = None;
+        self.chunk_start_pts = None;
+    }
+    fn mut_stream_from_pad(&mut self, pad: &gst_base::AggregatorPad) -> Option<&mut Stream> {
+        self.streams.iter_mut().find(|s| *pad == s.sinkpad)
+    }
 }
 
 #[derive(Default)]
@@ -849,7 +895,7 @@ impl FMP4Mux {
     // Caps/tag changes are allowed only in case that the
     // header-update-mode is None.
     //
-    // CAUTION: This function logs a warning if operation is not
+    // CAUTION: This function logs an error if operation is not
     // allowed so it should be evaluated only in case the caps/tags
     // would change otherwise (e. g. right-most operand in boolean
     // expressions).
@@ -1324,10 +1370,10 @@ impl FMP4Mux {
         let fragment_end_pts = fragment_start_pts + settings.fragment_duration;
 
         // If we have a manual fragment boundary set then use that
-        return *manual_fragment_boundaries
+        *manual_fragment_boundaries
             .range((Excluded(fragment_start_pts), Excluded(fragment_end_pts)))
             .next()
-            .unwrap_or(&fragment_end_pts);
+            .unwrap_or(&fragment_end_pts)
     }
 
     /// Check if the stream is filled enough for the current chunk / fragment.
@@ -2936,6 +2982,38 @@ impl FMP4Mux {
                 }
             };
 
+            // Check if language or orientation tags have already been
+            // received
+            let mut stream_orientation = Default::default();
+            let mut global_orientation = Default::default();
+            let mut language_code = None;
+            pad.sticky_events_foreach(|ev| {
+                if let gst::EventView::Tag(ev) = ev.view() {
+                    let tag = ev.tag();
+                    if let Some(l) = tag.get::<gst::tags::LanguageCode>() {
+                        // There is no header field for global
+                        // language code, maybe because it does not
+                        // really make sense, global language tags are
+                        // considered to be stream local
+                        if tag.scope() == gst::TagScope::Global {
+                            gst::info!(
+                                CAT,
+                                obj = pad,
+                                "Language tags scoped 'global' are considered stream tags",
+                            );
+                        }
+                        language_code = Stream::parse_language_code(l.get());
+                    } else if tag.get::<gst::tags::ImageOrientation>().is_some() {
+                        if tag.scope() == gst::TagScope::Global {
+                            global_orientation = TransformMatrix::from_tag(self, ev);
+                        } else {
+                            stream_orientation = Some(TransformMatrix::from_tag(self, ev));
+                        }
+                    }
+                }
+                std::ops::ControlFlow::Continue(gst::EventForeachAction::Keep)
+            });
+
             gst::info!(CAT, obj = pad, "Configuring caps {:?}", caps);
 
             let s = caps.structure(0).unwrap();
@@ -3021,6 +3099,9 @@ impl FMP4Mux {
                 extra_header_data: None,
                 earliest_pts: None,
                 end_pts: None,
+                language_code,
+                global_orientation,
+                stream_orientation,
                 elst_infos: Vec::new(),
             });
         }
@@ -3092,6 +3173,8 @@ impl FMP4Mux {
                     delta_frames: s.delta_frames,
                     caps: s.caps.clone(),
                     extra_header_data: s.extra_header_data.clone(),
+                    language_code: s.language_code,
+                    orientation: s.orientation(),
                     elst_infos: s.get_elst_infos().unwrap_or_else(|e| {
                         gst::error!(CAT, "Could not prepare edit lists: {e:?}");
 
@@ -3114,8 +3197,6 @@ impl FMP4Mux {
             streams,
             write_mehd: settings.write_mehd,
             duration: if at_eos { duration } else { None },
-            language_code: state.language_code,
-            orientation: state.orientation,
             write_edts,
             start_utc_time: if variant == super::Variant::ONVIF {
                 state
@@ -3252,7 +3333,7 @@ impl ObjectImpl for FMP4Mux {
             vec![
                 glib::subclass::Signal::builder(FMP4_SIGNAL_SEND_HEADERS)
                     .action()
-                    .class_handler(|_token, args| {
+                    .class_handler(|args| {
                         let element = args[0].get::<super::FMP4Mux>().expect("signal arg");
                         let imp = element.imp();
                         let mut state = imp.state.lock().unwrap();
@@ -3270,7 +3351,7 @@ impl ObjectImpl for FMP4Mux {
                 glib::subclass::Signal::builder(FMP4_SIGNAL_SPLIT_AT_RUNNING_TIME)
                     .param_types([gst::ClockTime::static_type()])
                     .action()
-                    .class_handler(|_token, args| {
+                    .class_handler(|args| {
                         let element = args[0].get::<super::FMP4Mux>().expect("signal arg");
                         let imp = element.imp();
                         let mut state = imp.state.lock().unwrap();
@@ -3623,34 +3704,32 @@ impl AggregatorImpl for FMP4Mux {
                 // Only care of caps if streams have been setup
                 let mut state = self.state.lock().unwrap();
                 if !state.streams.is_empty() {
-                    state.need_new_header = if let Some(stream) = state
-                        .streams
-                        .iter_mut()
-                        .find(|s| *aggregator_pad == s.sinkpad)
-                    {
-                        if !self.caps_compatible(stream, caps.caps())
-                            && self.header_update_allowed("caps")
-                        {
-                            gst::trace!(
-                                CAT,
-                                obj = aggregator_pad,
-                                "Update caps and send new headers {:?}",
-                                caps
-                            );
-                            stream.next_caps = Some(caps.caps_owned());
-                            true
-                        } else {
-                            false
-                        }
-                    } else {
-                        false
-                    };
+                    state.need_new_header =
+                        state
+                            .mut_stream_from_pad(aggregator_pad)
+                            .is_some_and(|stream| {
+                                if !self.caps_compatible(stream, caps.caps())
+                                    && self.header_update_allowed("caps")
+                                {
+                                    gst::trace!(
+                                        CAT,
+                                        obj = aggregator_pad,
+                                        "Update caps and send new headers {:?}",
+                                        caps
+                                    );
+                                    stream.next_caps = Some(caps.caps_owned());
+                                    true
+                                } else {
+                                    false
+                                }
+                            });
                 }
                 drop(state);
                 self.parent_sink_event(aggregator_pad, event)
             }
             EventView::Tag(ev) => {
-                if let Some(tag_value) = ev.tag().get::<gst::tags::LanguageCode>() {
+                let tag = ev.tag();
+                if let Some(tag_value) = tag.get::<gst::tags::LanguageCode>() {
                     let lang = tag_value.get();
                     gst::trace!(
                         CAT,
@@ -3660,34 +3739,26 @@ impl AggregatorImpl for FMP4Mux {
                     );
 
                     // Language as ISO-639-2/T
-                    if lang.len() == 3 && lang.chars().all(|c| c.is_ascii_lowercase()) {
+                    if let Some(language_code) = Stream::parse_language_code(lang) {
                         let mut state = self.state.lock().unwrap();
 
-                        let mut language_code: [u8; 3] = [0; 3];
-                        for (out, c) in Iterator::zip(language_code.iter_mut(), lang.chars()) {
-                            *out = c as u8;
-                        }
-
-                        let language_code = Some(language_code);
-                        // If the language changed and we have buffers
-                        // trigger caps change
-                        if state.language_code != language_code
-                            && !state.streams.is_empty()
-                            && self.header_update_allowed("language code")
+                        if !state.streams.is_empty() && self.header_update_allowed("language code")
                         {
-                            state.language_code = language_code;
-                            state.need_new_header = true;
-
-                            if let Some(stream) = state
-                                .streams
-                                .iter_mut()
-                                .find(|s| *aggregator_pad == s.sinkpad)
-                            {
-                                stream.tag_changed = true;
+                            if tag.scope() == gst::TagScope::Global {
+                                gst::info!(
+                                    CAT,
+                                    imp = self,
+                                    "Language tags scoped 'global' are considered stream tags",
+                                );
                             }
+
+                            state.need_new_header = true;
+                            let stream = state.mut_stream_from_pad(aggregator_pad).unwrap();
+                            stream.language_code = Some(language_code);
+                            stream.tag_changed = true;
                         }
                     }
-                } else if let Some(tag_value) = ev.tag().get::<gst::tags::ImageOrientation>() {
+                } else if let Some(tag_value) = tag.get::<gst::tags::ImageOrientation>() {
                     let orientation = tag_value.get();
                     gst::trace!(
                         CAT,
@@ -3697,35 +3768,16 @@ impl AggregatorImpl for FMP4Mux {
                     );
 
                     let mut state = self.state.lock().unwrap();
-                    let orientation = match orientation {
-                        "rotate-0" => Some(ImageOrientation::Rotate0),
-                        "rotate-90" => Some(ImageOrientation::Rotate90),
-                        "rotate-180" => Some(ImageOrientation::Rotate180),
-                        "rotate-270" => Some(ImageOrientation::Rotate270),
-                        // TODO:
-                        // "flip-rotate-0" => Some(ImageOrientation::FlipRotate0),
-                        // "flip-rotate-90" => Some(ImageOrientation::FlipRotate90),
-                        // "flip-rotate-180" => Some(ImageOrientation::FlipRotate180),
-                        // "flip-rotate-270" => Some(ImageOrientation::FlipRotate270),
-                        _ => {
-                            gst::info!(
-                                CAT,
-                                imp = self,
-                                "Orientation {:?} not yet supported",
-                                orientation
-                            );
-                            None
-                        }
-                    };
 
-                    // If the orientation changed and we have buffers
-                    // trigger caps change
-                    if state.orientation != orientation
-                        && !state.streams.is_empty()
-                        && self.header_update_allowed("orientation")
-                    {
-                        state.orientation = orientation;
+                    if !state.streams.is_empty() && self.header_update_allowed("orientation") {
                         state.need_new_header = true;
+                        let stream = state.mut_stream_from_pad(aggregator_pad).unwrap();
+                        if tag.scope() == gst::TagScope::Stream {
+                            stream.stream_orientation = Some(TransformMatrix::from_tag(self, ev));
+                        } else {
+                            stream.global_orientation = TransformMatrix::from_tag(self, ev);
+                        }
+                        stream.tag_changed = true;
                     }
                 }
 
@@ -3762,23 +3814,8 @@ impl AggregatorImpl for FMP4Mux {
     }
 
     fn flush(&self) -> Result<gst::FlowSuccess, gst::FlowError> {
-        let mut state = self.state.lock().unwrap();
-
-        for stream in &mut state.streams {
-            stream.queued_gops.clear();
-            stream.dts_offset = None;
-            stream.current_position = gst::ClockTime::ZERO;
-            stream.fragment_filled = false;
-            stream.pre_queue.clear();
-            stream.running_time_utc_time_mapping = None;
-        }
-
-        state.current_offset = 0;
-        state.fragment_offsets.clear();
-        state.manual_fragment_boundaries.clear();
-
-        drop(state);
-
+        gst::trace!(CAT, imp = self, "Flush");
+        self.state.lock().unwrap().flush();
         self.parent_flush()
     }
 
@@ -4534,16 +4571,10 @@ impl AggregatorPadImpl for FMP4MuxPad {
         let mux = aggregator.downcast_ref::<super::FMP4Mux>().unwrap();
         let mut mux_state = mux.imp().state.lock().unwrap();
 
-        for stream in &mut mux_state.streams {
-            if stream.sinkpad == *self.obj() {
-                stream.queued_gops.clear();
-                stream.dts_offset = None;
-                stream.current_position = gst::ClockTime::ZERO;
-                stream.fragment_filled = false;
-                stream.pre_queue.clear();
-                stream.running_time_utc_time_mapping = None;
-                break;
-            }
+        if let Some(stream) =
+            mux_state.mut_stream_from_pad(self.obj().upcast_ref::<gst_base::AggregatorPad>())
+        {
+            stream.flush();
         }
 
         drop(mux_state);

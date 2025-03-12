@@ -1,6 +1,8 @@
 // Copyright (C) 2024, Asymptotic Inc.
 //      Author: Sanchayan Maity <sanchayan@asymptotic.io>
-//G
+// Copyright (C) 2024, Fluendo S.A.
+//      Author: Andoni Morales Alastruey <amorales@fluendo.com>
+//
 // This Source Code Form is subject to the terms of the Mozilla Public License, v2.0.
 // If a copy of the MPL was not distributed with this file, You can obtain one at
 // <https://mozilla.org/MPL/2.0/>.
@@ -34,13 +36,14 @@ pub const CONNECTION_CLOSE_MSG: &str = "Stopped";
 pub struct QuinnQuicEndpointConfig {
     pub server_addr: SocketAddr,
     pub server_name: String,
-    pub client_addr: SocketAddr,
+    pub client_addr: Option<SocketAddr>,
     pub secure_conn: bool,
     pub alpns: Vec<String>,
     pub certificate_file: Option<PathBuf>,
     pub private_key_file: Option<PathBuf>,
     pub keep_alive_interval: u64,
     pub transport_config: QuinnQuicTransportConfig,
+    pub with_client_auth: bool,
 }
 
 #[derive(Error, Debug)]
@@ -207,22 +210,55 @@ impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
     }
 }
 
+fn create_transport_config(
+    ep_config: &QuinnQuicEndpointConfig,
+    set_keep_alive: bool,
+) -> TransportConfig {
+    let mtu_config = MtuDiscoveryConfig::default()
+        .upper_bound(ep_config.transport_config.upper_bound_mtu)
+        .to_owned();
+    let mut transport_config = TransportConfig::default();
+
+    if ep_config.keep_alive_interval > 0 && set_keep_alive {
+        transport_config
+            .keep_alive_interval(Some(Duration::from_millis(ep_config.keep_alive_interval)));
+    }
+    transport_config.initial_mtu(ep_config.transport_config.initial_mtu);
+    transport_config.min_mtu(ep_config.transport_config.min_mtu);
+    transport_config.datagram_receive_buffer_size(Some(
+        ep_config.transport_config.datagram_receive_buffer_size,
+    ));
+    transport_config
+        .datagram_send_buffer_size(ep_config.transport_config.datagram_send_buffer_size);
+    transport_config
+        .max_concurrent_bidi_streams(ep_config.transport_config.max_concurrent_bidi_streams);
+    transport_config
+        .max_concurrent_uni_streams(ep_config.transport_config.max_concurrent_uni_streams);
+    transport_config.mtu_discovery_config(Some(mtu_config));
+
+    transport_config
+}
+
 fn configure_client(ep_config: &QuinnQuicEndpointConfig) -> Result<ClientConfig, Box<dyn Error>> {
     let ring_provider = rustls::crypto::ring::default_provider();
 
     let mut crypto = if ep_config.secure_conn {
-        let (certs, key) = read_certs_from_file(
-            ep_config.certificate_file.clone(),
-            ep_config.private_key_file.clone(),
-        )?;
+        let certs = read_certs_from_file(ep_config.certificate_file.clone())?;
+
         let mut cert_store = rustls::RootCertStore::empty();
         cert_store.add_parsable_certificates(certs.clone());
 
-        rustls::ClientConfig::builder_with_provider(ring_provider.into())
+        let builder = rustls::ClientConfig::builder_with_provider(ring_provider.into())
             .with_protocol_versions(&[&rustls::version::TLS13])
             .unwrap()
-            .with_root_certificates(Arc::new(cert_store))
-            .with_client_auth_cert(certs, key)?
+            .with_root_certificates(Arc::new(cert_store));
+        match ep_config.private_key_file.clone() {
+            Some(key_file) => {
+                let key = read_private_key_from_file(Some(key_file))?;
+                builder.with_client_auth_cert(certs, key).unwrap()
+            }
+            None => builder.with_no_client_auth(),
+        }
     } else {
         rustls::ClientConfig::builder_with_provider(ring_provider.into())
             .with_protocol_versions(&[&rustls::version::TLS13])
@@ -240,30 +276,7 @@ fn configure_client(ep_config: &QuinnQuicEndpointConfig) -> Result<ClientConfig,
     crypto.alpn_protocols = alpn_protocols;
     crypto.key_log = Arc::new(rustls::KeyLogFile::new());
 
-    let transport_config = {
-        let mtu_config = MtuDiscoveryConfig::default()
-            .upper_bound(ep_config.transport_config.upper_bound_mtu)
-            .to_owned();
-        let mut transport_config = TransportConfig::default();
-
-        if ep_config.keep_alive_interval > 0 {
-            transport_config
-                .keep_alive_interval(Some(Duration::from_millis(ep_config.keep_alive_interval)));
-        }
-        transport_config.initial_mtu(ep_config.transport_config.initial_mtu);
-        transport_config.min_mtu(ep_config.transport_config.min_mtu);
-        transport_config.datagram_receive_buffer_size(Some(
-            ep_config.transport_config.datagram_receive_buffer_size,
-        ));
-        transport_config
-            .datagram_send_buffer_size(ep_config.transport_config.datagram_send_buffer_size);
-        transport_config.max_concurrent_bidi_streams(0u32.into());
-        transport_config.max_concurrent_uni_streams(1u32.into());
-        transport_config.mtu_discovery_config(Some(mtu_config));
-
-        transport_config
-    };
-
+    let transport_config = create_transport_config(ep_config, true);
     let client_config = ClientConfig::new(Arc::new(QuicClientConfig::try_from(crypto)?))
         .transport_config(Arc::new(transport_config))
         .to_owned();
@@ -273,14 +286,7 @@ fn configure_client(ep_config: &QuinnQuicEndpointConfig) -> Result<ClientConfig,
 
 fn read_certs_from_file(
     certificate_file: Option<PathBuf>,
-    private_key_file: Option<PathBuf>,
-) -> Result<
-    (
-        Vec<rustls_pki_types::CertificateDer<'static>>,
-        rustls_pki_types::PrivateKeyDer<'static>,
-    ),
-    Box<dyn Error>,
-> {
+) -> Result<Vec<rustls_pki_types::CertificateDer<'static>>, Box<dyn Error>> {
     /*
      * NOTE:
      *
@@ -298,7 +304,6 @@ fn read_certs_from_file(
     let cert_file = certificate_file
         .clone()
         .expect("Expected path to certificates be valid");
-    let key_file = private_key_file.expect("Expected path to certificates be valid");
 
     let certs: Vec<rustls_pki_types::CertificateDer<'static>> = {
         let cert_file = File::open(cert_file.as_path())?;
@@ -306,6 +311,13 @@ fn read_certs_from_file(
         let cert_vec = rustls_pemfile::certs(&mut cert_file_rdr);
         cert_vec.into_iter().map(|c| c.unwrap()).collect()
     };
+    Ok(certs)
+}
+
+fn read_private_key_from_file(
+    private_key_file: Option<PathBuf>,
+) -> Result<rustls_pki_types::PrivateKeyDer<'static>, Box<dyn Error>> {
+    let key_file = private_key_file.expect("Expected path to private key to be valid");
 
     let key: rustls_pki_types::PrivateKeyDer<'static> = {
         let key_file = File::open(key_file.as_path())?;
@@ -321,21 +333,22 @@ fn read_certs_from_file(
         match key_item {
             rustls_pemfile::Item::Pkcs1Key(key) => rustls_pki_types::PrivateKeyDer::from(key),
             rustls_pemfile::Item::Pkcs8Key(key) => rustls_pki_types::PrivateKeyDer::from(key),
+            rustls_pemfile::Item::Sec1Key(key) => rustls_pki_types::PrivateKeyDer::from(key),
             _ => unimplemented!(),
         }
     };
 
-    Ok((certs, key))
+    Ok(key)
 }
 
 fn configure_server(
     ep_config: &QuinnQuicEndpointConfig,
 ) -> Result<(ServerConfig, Vec<rustls_pki_types::CertificateDer>), Box<dyn Error>> {
     let (certs, key) = if ep_config.secure_conn {
-        read_certs_from_file(
-            ep_config.certificate_file.clone(),
-            ep_config.private_key_file.clone(),
-        )?
+        (
+            read_certs_from_file(ep_config.certificate_file.clone())?,
+            read_private_key_from_file(ep_config.private_key_file.clone())?,
+        )
     } else {
         let rcgen::CertifiedKey { cert, key_pair } =
             rcgen::generate_simple_self_signed(vec![ep_config.server_name.clone()]).unwrap();
@@ -351,18 +364,25 @@ fn configure_server(
         let mut cert_store = rustls::RootCertStore::empty();
         cert_store.add_parsable_certificates(certs.clone());
 
-        let auth_client = rustls::server::WebPkiClientVerifier::builder_with_provider(
-            Arc::new(cert_store),
-            ring_provider.clone().into(),
-        )
-        .build()
-        .unwrap();
-
-        rustls::ServerConfig::builder_with_provider(ring_provider.into())
-            .with_protocol_versions(&[&rustls::version::TLS13])
-            .unwrap()
-            .with_client_cert_verifier(auth_client)
-            .with_single_cert(certs.clone(), key)
+        let config_builder =
+            rustls::ServerConfig::builder_with_provider(ring_provider.clone().into())
+                .with_protocol_versions(&[&rustls::version::TLS13])
+                .unwrap();
+        if ep_config.with_client_auth {
+            let auth_client = rustls::server::WebPkiClientVerifier::builder_with_provider(
+                Arc::new(cert_store),
+                ring_provider.into(),
+            )
+            .build()
+            .unwrap();
+            config_builder
+                .with_client_cert_verifier(auth_client)
+                .with_single_cert(certs.clone(), key)
+        } else {
+            config_builder
+                .with_no_client_auth()
+                .with_single_cert(certs.clone(), key)
+        }
     } else {
         rustls::ServerConfig::builder_with_provider(ring_provider.into())
             .with_protocol_versions(&[&rustls::version::TLS13])
@@ -379,26 +399,7 @@ fn configure_server(
     crypto.alpn_protocols = alpn_protocols;
     crypto.key_log = Arc::new(rustls::KeyLogFile::new());
 
-    let transport_config = {
-        let mtu_config = MtuDiscoveryConfig::default()
-            .upper_bound(ep_config.transport_config.upper_bound_mtu)
-            .to_owned();
-        let mut transport_config = TransportConfig::default();
-
-        transport_config.initial_mtu(ep_config.transport_config.initial_mtu);
-        transport_config.min_mtu(ep_config.transport_config.min_mtu);
-        transport_config.datagram_receive_buffer_size(Some(
-            ep_config.transport_config.datagram_receive_buffer_size,
-        ));
-        transport_config
-            .datagram_send_buffer_size(ep_config.transport_config.datagram_send_buffer_size);
-        transport_config.max_concurrent_bidi_streams(0u32.into());
-        transport_config.max_concurrent_uni_streams(1u32.into());
-        transport_config.mtu_discovery_config(Some(mtu_config));
-
-        transport_config
-    };
-
+    let transport_config = create_transport_config(ep_config, false);
     let server_config = ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(crypto)?))
         .transport_config(Arc::new(transport_config))
         .to_owned();
@@ -425,18 +426,17 @@ pub fn server_endpoint(ep_config: &QuinnQuicEndpointConfig) -> Result<Endpoint, 
 
 pub fn client_endpoint(ep_config: &QuinnQuicEndpointConfig) -> Result<Endpoint, Box<dyn Error>> {
     let client_cfg = configure_client(ep_config)?;
-    let mut endpoint = Endpoint::client(ep_config.client_addr)?;
+    let mut endpoint = Endpoint::client(ep_config.client_addr.expect("client_addr not set"))?;
 
     endpoint.set_default_client_config(client_cfg);
 
     Ok(endpoint)
 }
 
-pub fn get_stats(connection: Option<Connection>) -> gst::Structure {
-    match connection {
-        Some(conn) => {
+pub fn get_stats(stats: Option<ConnectionStats>) -> gst::Structure {
+    match stats {
+        Some(stats) => {
             // See quinn_proto::ConnectionStats
-            let stats = conn.stats();
             let udp_stats = |udp: UdpStats, name: String| -> gst::Structure {
                 gst::Structure::builder(name)
                     .field("datagrams", udp.datagrams)

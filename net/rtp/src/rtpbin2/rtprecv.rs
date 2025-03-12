@@ -1011,7 +1011,7 @@ impl RtpRecv {
                     if !split_bufferlist
                         && previous_jb
                             .as_ref()
-                            .map_or(false, |previous| !Arc::ptr_eq(previous, &jb))
+                            .is_some_and(|previous| !Arc::ptr_eq(previous, &jb))
                     {
                         split_bufferlist = true;
                     }
@@ -1659,7 +1659,7 @@ impl ObjectImpl for RtpRecv {
                 .param_types([u32::static_type()])
                 .return_type::<crate::rtpbin2::config::Rtp2Session>()
                 .action()
-                .class_handler(|_token, args| {
+                .class_handler(|args| {
                     let element = args[0].get::<super::RtpRecv>().expect("signal arg");
                     let id = args[1].get::<u32>().expect("signal arg");
                     let bin = element.imp();

@@ -83,13 +83,27 @@ fn fps_from_caps(caps: &gst::CapsRef) -> Result<Framerate, gst::LoggableError> {
     ))
 }
 
-#[derive(Default)]
 struct State {
     out_format: CeaFormat,
     fps: Option<Framerate>,
     dtvcc_seq_no: u8,
     writer: CCDataWriter,
     n_frames: u64,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        let mut writer = CCDataWriter::default();
+        writer.set_output_padding(true);
+        writer.set_output_cea608_padding(true);
+        Self {
+            out_format: CeaFormat::default(),
+            fps: None,
+            dtvcc_seq_no: 0,
+            writer,
+            n_frames: 0,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -148,11 +162,6 @@ impl AggregatorImpl for Cea708Mux {
                 .expect("Not a Cea708MuxSinkPad?!")
         }) {
             let mut pad_state = pad.imp().pad_state.lock().unwrap();
-            // any data we currently have stored
-            let have_pending = pad_state
-                .pending_services
-                .values()
-                .any(|codes| !codes.is_empty());
 
             if pad.is_eos() {
                 if pad_state.pending_buffer.is_some() {
@@ -193,17 +202,10 @@ impl AggregatorImpl for Cea708Mux {
             }
             let duration = buffer.duration().unwrap_or(gst::ClockTime::ZERO);
             let buffer_end_ts = buffer_start_ts + duration;
-            // allow a 1 second grace period before dropping data
-            if start_running_time.saturating_sub(buffer_end_ts) > gst::ClockTime::from_seconds(1) {
-                gst::warning!(CAT, obj = pad,
-                    "Dropping buffer because start_running_time {} is more than 1s later than buffer_end_ts {}",
-                    start_running_time.display(),
-                    buffer_end_ts.display());
-                pad.drop_buffer();
-                if !have_pending {
-                    need_data = true;
-                }
-                continue;
+            if start_running_time.saturating_sub(buffer_end_ts) > gst::ClockTime::ZERO {
+                // need to wait for the next input buffer which might need to be part of this
+                // output buffer.
+                need_data = true;
             }
 
             let Ok(mapped) = buffer.map_readable() else {
@@ -228,6 +230,12 @@ impl AggregatorImpl for Cea708Mux {
                     cc_data[1] = 0xFF;
                     cc_data.extend(mapped.iter());
                     pad_state.ccp_parser.push(&cc_data).unwrap();
+
+                    if let Some(cea608) = pad_state.ccp_parser.cea608() {
+                        for pair in cea608 {
+                            state.writer.push_cea608(*pair);
+                        }
+                    }
                 }
                 _ => unreachable!(),
             }
@@ -316,15 +324,30 @@ impl AggregatorImpl for Cea708Mux {
                             }
                         }
                     }
+                    for (service_no, pending_codes) in pad_state.pending_services.iter_mut() {
+                        let new_service = services
+                            .entry(*service_no)
+                            .or_insert_with_key(|&n| Service::new(n));
+
+                        while let Some(code) = pending_codes.pop_front() {
+                            match new_service.push_code(&code) {
+                                Ok(_) => (),
+                                Err(cea708_types::WriterError::WouldOverflow(_)) => {
+                                    pending_codes.push_front(code);
+                                    break;
+                                }
+                                Err(cea708_types::WriterError::ReadOnly) => unreachable!(),
+                            }
+                        }
+                    }
                 }
                 _ => (),
             }
         }
 
         let mut packet = DTVCCPacket::new(state.dtvcc_seq_no & 0x3);
-        state.dtvcc_seq_no = state.dtvcc_seq_no.wrapping_add(1);
 
-        for (_service_no, service) in services.into_iter() {
+        for (_service_no, service) in services.into_iter().filter(|(_, s)| !s.codes().is_empty()) {
             // FIXME: handle needing to split services
             gst::trace!(
                 CAT,
@@ -333,6 +356,9 @@ impl AggregatorImpl for Cea708Mux {
                 service.number()
             );
             packet.push_service(service).unwrap();
+            if packet.sequence_no() == state.dtvcc_seq_no & 0x3 {
+                state.dtvcc_seq_no = state.dtvcc_seq_no.wrapping_add(1);
+            }
         }
 
         let mut data = vec![];
@@ -637,12 +663,24 @@ impl ObjectSubclass for Cea708Mux {
     type ParentType = gst_base::Aggregator;
 }
 
-#[derive(Default)]
 struct PadState {
     format: CeaFormat,
     ccp_parser: CCDataParser,
     pending_services: HashMap<u8, VecDeque<cea708_types::tables::Code>>,
     pending_buffer: Option<gst::Buffer>,
+}
+
+impl Default for PadState {
+    fn default() -> Self {
+        let mut ccp_parser = CCDataParser::default();
+        ccp_parser.handle_cea608();
+        Self {
+            format: CeaFormat::default(),
+            ccp_parser,
+            pending_services: HashMap::default(),
+            pending_buffer: None,
+        }
+    }
 }
 
 #[derive(Default)]

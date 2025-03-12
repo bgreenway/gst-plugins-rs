@@ -163,7 +163,7 @@ impl RaptorqEnc {
         );
 
         let encoder =
-            SourceBlockEncoder::with_encoding_plan2(0, &state.info, &source_block, &state.plan);
+            SourceBlockEncoder::with_encoding_plan(0, &state.info, &source_block, &state.plan);
 
         let sbl = state.symbols_per_block;
 
@@ -576,7 +576,7 @@ impl RaptorqEnc {
         // it SHALL be the same for all repair packets in a block. This include
         // 1 byte of flow indication and 2 bytes of length indication as defined
         // in RFC6881, section 8.2.4.
-        let symbols_per_packet = (mtu + 3 + symbol_size - 1) / symbol_size;
+        let symbols_per_packet = (mtu + 3).div_ceil(symbol_size);
         let symbols_per_block = symbols_per_packet * protected_packets_num;
 
         if symbol_size.rem_euclid(SYMBOL_ALIGNMENT) != 0 {

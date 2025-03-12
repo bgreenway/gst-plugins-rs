@@ -5,6 +5,7 @@ project('gst-plugins-rs',
         meson_version : '>= 1.1')
 
 # dependencies.py needs a toml parsing module
+api_version = '1.0'
 python = import('python').find_installation(modules: ['tomllib'], required: false)
 if not python.found()
   python = import('python').find_installation(modules: ['tomli'])
@@ -150,6 +151,7 @@ plugins = {
     'extra-deps': {'openssl': ['>=1.1']},
   },
   'mpegtslive': {'library': 'libgstmpegtslive'},
+  'hlsmultivariantsink': {'library': 'libgsthlsmultivariantsink'},
   'hlssink3': {'library': 'libgsthlssink3'},
   'ndi': {'library': 'libgstndi'},
   'onvif': {
@@ -165,6 +167,7 @@ plugins = {
   'webrtc': {
     'library': 'libgstrswebrtc',
     'examples': ['webrtcsink-stats-server'],
+    'option-features': ['aws', 'livekit']
   },
 
   'textahead': {'library': 'libgsttextahead'},
@@ -211,8 +214,18 @@ plugins = {
     'extra-deps': {'cairo-gobject': []},
   },
   'gopbuffer': {'library': 'libgstgopbuffer'},
-  'quinn': {'library': 'libgstquinn'},
+  'quinn': {
+    'library': 'libgstquinn',
+    'examples': [
+      'quic_mux',
+      'quic_roq',
+    ],
+  },
   'speechmatics': {'library': 'libgstspeechmatics'},
+  'vvdec': {
+    'library': 'libgstvvdec',
+    'extra-deps': {'libvvdec': ['>= 3.0']}
+  }
 }
 
 # Won't build on platforms where it bundles the sources because of:
@@ -295,7 +308,9 @@ if get_option('gtk4').allowed()
       gtk4_features += 'dmabuf'
     endif
 
-    if gtk_dep.version().version_compare('>=4.14')
+    if gtk_dep.version().version_compare('>=4.16')
+      gtk4_features += 'gtk_v4_16'
+    elif gtk_dep.version().version_compare('>=4.14')
       gtk4_features += 'gtk_v4_14'
     elif gtk_dep.version().version_compare('>=4.12')
       gtk4_features += 'gtk_v4_12'
@@ -452,6 +467,14 @@ foreach plugin_name, details: plugins
     continue
   endif
 
+  option_features = []
+  foreach feature : details.get('option-features', [])
+    if get_option(f'@plugin_name@-@feature@').allowed()
+      message(f'Enabling @feature@ for @plugin_name@')
+      features += [feature]
+    endif
+  endforeach
+
   # Check if we have the required GStreamer version
   if details.has_key('gst-version') and not \
       deps_cache['gstreamer-1.0'].version().version_compare(details['gst-version'])
@@ -529,12 +552,13 @@ if pkg_config.found()
   extra_env += {'PKG_CONFIG': pkg_config.full_path()}
 endif
 
+pathsep = ':'
+if host_system == 'windows'
+  pathsep = ';'
+endif
+
 pkg_config_path = get_option('pkg_config_path')
 if pkg_config_path.length() > 0
-  pathsep = ':'
-  if host_system == 'windows'
-    pathsep = ';'
-  endif
   extra_env += {'PKG_CONFIG_PATH': pathsep.join(pkg_config_path)}
 endif
 

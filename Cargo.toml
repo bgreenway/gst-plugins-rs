@@ -25,6 +25,7 @@ members = [
     "mux/mp4",
 
     "net/aws",
+    "net/hlsmultivariantsink",
     "net/hlssink3",
     "net/mpegtslive",
     "net/ndi",
@@ -61,6 +62,7 @@ members = [
     "video/png",
     "video/rav1e",
     "video/videofx",
+    "video/vvdec",
     "video/webp",
 ]
 
@@ -117,7 +119,7 @@ default-members = [
 ]
 
 [profile.release]
-lto = true
+lto = "thin"
 opt-level = 3
 debug = true
 panic = 'unwind'

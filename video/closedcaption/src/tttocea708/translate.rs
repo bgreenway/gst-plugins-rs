@@ -52,7 +52,6 @@ pub struct TextToCea708 {
     // settings
     mode: Cea708Mode,
     roll_up_count: u8,
-    service_no: u8,
     cea608_channel: Option<cea608_types::Id>,
     origin_column: u32,
     roll_up_timeout: Option<gst::ClockTime>,
@@ -73,11 +72,13 @@ pub struct TextToCea708 {
 
 impl Default for TextToCea708 {
     fn default() -> Self {
+        let mut cc_data_writer = CCDataWriter::default();
+        cc_data_writer.set_output_padding(true);
+        cc_data_writer.set_output_cea608_padding(true);
         Self {
             cea608: TextToCea608::default(),
             mode: Cea708Mode::RollUp,
             roll_up_count: 2,
-            service_no: 1,
             cea608_channel: Some(cea608_types::Id::CC1),
             origin_column: 0,
             framerate: gst::Fraction::new(DEFAULT_FPS_N, DEFAULT_FPS_D),
@@ -85,7 +86,7 @@ impl Default for TextToCea708 {
             output_packets: VecDeque::new(),
             sequence_no: 0,
             service_writer: Cea708ServiceWriter::new(1),
-            cc_data_writer: CCDataWriter::default(),
+            cc_data_writer,
             pen_location: SetPenLocationArgs::new(0, 0),
             pen_color: textstyle_to_pen_color(TextStyle::White),
             pen_attributes: SetPenAttributesArgs::new(
@@ -179,7 +180,9 @@ impl TextToCea708 {
     }
 
     pub fn set_service_no(&mut self, service_no: u8) {
-        self.service_no = service_no;
+        if service_no != self.service_writer.service_no() {
+            self.service_writer = Cea708ServiceWriter::new(service_no);
+        }
     }
 
     pub fn last_frame_no(&self) -> u64 {
@@ -260,16 +263,16 @@ impl TextToCea708 {
     fn cc_data(&mut self) {
         self.check_erase_display();
 
-        self.last_frame_no += 1;
-
         let seq_no = self.sequence_no;
-        self.sequence_no = (self.sequence_no + 1) & 0x3;
 
         let mut packet = DTVCCPacket::new(seq_no);
         gst::trace!(CAT, "New packet {}", packet.sequence_no());
         while let Some(service) = self.service_writer.take_service(packet.free_space()) {
             gst::trace!(CAT, "adding service {service:?} to packet");
             packet.push_service(service).unwrap();
+            if seq_no == self.sequence_no {
+                self.sequence_no = (self.sequence_no + 1) & 0x3;
+            }
         }
         gst::trace!(CAT, "push packet to writer");
         self.cc_data_writer.push_packet(packet);
@@ -300,6 +303,8 @@ impl TextToCea708 {
             packet: cc_data[2..].to_vec(),
             frame_no: self.last_frame_no,
         });
+
+        self.last_frame_no += 1;
     }
 
     fn pad(&mut self, frame_no: u64) {
@@ -332,8 +337,6 @@ impl TextToCea708 {
         if self.cea608_channel.is_some() {
             self.cea608.generate(frame_no, end_frame_no, lines.clone());
         }
-
-        self.service_writer = Cea708ServiceWriter::new(self.service_no);
 
         if self.mode == Cea708Mode::PopOn || self.mode == Cea708Mode::PaintOn {
             self.pen_location.column = 0;

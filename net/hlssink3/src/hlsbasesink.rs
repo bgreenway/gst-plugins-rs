@@ -204,39 +204,37 @@ impl ObjectImpl for HlsBaseSink {
                 glib::subclass::Signal::builder(SIGNAL_GET_PLAYLIST_STREAM)
                     .param_types([String::static_type()])
                     .return_type::<Option<gio::OutputStream>>()
-                    .class_handler(|_, args| {
+                    .class_handler(|args| {
                         let elem = args[0].get::<super::HlsBaseSink>().expect("signal arg");
                         let playlist_location = args[1].get::<String>().expect("signal arg");
                         let imp = elem.imp();
 
                         Some(imp.new_file_stream(&playlist_location).ok().to_value())
                     })
-                    .accumulator(|_hint, ret, value| {
+                    .accumulator(|_hint, _acc, value| {
                         // First signal handler wins
-                        *ret = value.clone();
-                        false
+                        std::ops::ControlFlow::Break(value.clone())
                     })
                     .build(),
                 glib::subclass::Signal::builder(SIGNAL_GET_FRAGMENT_STREAM)
                     .param_types([String::static_type()])
                     .return_type::<Option<gio::OutputStream>>()
-                    .class_handler(|_, args| {
+                    .class_handler(|args| {
                         let elem = args[0].get::<super::HlsBaseSink>().expect("signal arg");
                         let fragment_location = args[1].get::<String>().expect("signal arg");
                         let imp = elem.imp();
 
                         Some(imp.new_file_stream(&fragment_location).ok().to_value())
                     })
-                    .accumulator(|_hint, ret, value| {
+                    .accumulator(|_hint, _acc, value| {
                         // First signal handler wins
-                        *ret = value.clone();
-                        false
+                        std::ops::ControlFlow::Break(value.clone())
                     })
                     .build(),
                 glib::subclass::Signal::builder(SIGNAL_DELETE_FRAGMENT)
                     .param_types([String::static_type()])
                     .return_type::<bool>()
-                    .class_handler(|_, args| {
+                    .class_handler(|args| {
                         let elem = args[0].get::<super::HlsBaseSink>().expect("signal arg");
                         let fragment_location = args[1].get::<String>().expect("signal arg");
                         let imp = elem.imp();
@@ -244,10 +242,9 @@ impl ObjectImpl for HlsBaseSink {
                         imp.delete_fragment(&fragment_location);
                         Some(true.to_value())
                     })
-                    .accumulator(|_hint, ret, value| {
+                    .accumulator(|_hint, _acc, value| {
                         // First signal handler wins
-                        *ret = value.clone();
-                        false
+                        std::ops::ControlFlow::Break(value.clone())
                     })
                     .build(),
             ]
@@ -341,13 +338,9 @@ impl HlsBaseSink {
 
         gst::trace!(CAT, imp = self, "Segment location formatted: {}", location);
 
-        let stream = match self
+        let stream = self
             .obj()
-            .emit_by_name::<Option<gio::OutputStream>>(SIGNAL_GET_FRAGMENT_STREAM, &[&location])
-        {
-            Some(stream) => stream,
-            None => return None,
-        };
+            .emit_by_name::<Option<gio::OutputStream>>(SIGNAL_GET_FRAGMENT_STREAM, &[&location])?;
 
         Some((stream, location))
     }
@@ -524,19 +517,30 @@ impl HlsBaseSink {
     where
         P: AsRef<path::Path>,
     {
-        let file = fs::File::create(location).map_err(move |err| {
-            let error_msg = gst::error_msg!(
-                gst::ResourceError::OpenWrite,
-                [
-                    "Could not open file {} for writing: {}",
-                    location.as_ref().to_str().unwrap(),
-                    err.to_string(),
-                ]
-            );
-            self.post_error_message(error_msg);
-            err.to_string()
-        })?;
-        Ok(gio::WriteOutputStream::new(file).upcast())
+        let file = gio::File::for_path(location);
+        // Open the file for writing, creating it if it doesn't exist
+        // Use replace() to write the content in atomic mode
+        // (writes to a temporary file and then atomically rename over the destination when the stream is closed)
+        let output_stream = file
+            .replace(
+                None,
+                false,
+                gio::FileCreateFlags::empty(),
+                None::<&gio::Cancellable>,
+            )
+            .map_err(move |err| {
+                let error_msg = gst::error_msg!(
+                    gst::ResourceError::OpenWrite,
+                    [
+                        "Could not open file {} for writing: {}",
+                        location.as_ref().to_str().unwrap(),
+                        err.to_string(),
+                    ]
+                );
+                self.post_error_message(error_msg);
+                err.to_string()
+            })?;
+        Ok(output_stream.upcast())
     }
 
     fn delete_fragment<P>(&self, location: &P)

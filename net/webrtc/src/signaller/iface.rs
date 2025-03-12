@@ -159,7 +159,7 @@ impl prelude::ObjectInterface for Signallable {
                  */
                 Signal::builder("request-meta")
                     .return_type::<Option<gst::Structure>>()
-                    .class_handler(|_token, args| {
+                    .class_handler(|args| {
                         let this = args[0usize]
                             .get::<&super::Signallable>()
                             .unwrap_or_else(|e| {
@@ -167,9 +167,9 @@ impl prelude::ObjectInterface for Signallable {
                             });
                         Some(Signallable::request_meta(this).to_value())
                     })
-                    .accumulator(move |_hint, output, input| {
-                        *output = input.clone();
-                        false
+                    .accumulator(move |_hint, _acc, value| {
+                        // First signal handler wins
+                        std::ops::ControlFlow::Break(value.clone())
                     })
                     .build(),
                 /**
@@ -215,7 +215,7 @@ impl prelude::ObjectInterface for Signallable {
                 Signal::builder("start")
                     .run_last()
                     .return_type::<bool>()
-                    .class_handler(|_token, args| {
+                    .class_handler(|args| {
                         let this = args[0usize]
                             .get::<&super::Signallable>()
                             .unwrap_or_else(|e| {
@@ -227,9 +227,9 @@ impl prelude::ObjectInterface for Signallable {
 
                         Some(false.into())
                     })
-                    .accumulator(move |_hint, output, input| {
-                        *output = input.clone();
-                        false
+                    .accumulator(move |_hint, _acc, value| {
+                        // First signal handler wins
+                        std::ops::ControlFlow::Break(value.clone())
                     })
                     .build(),
                 /**
@@ -241,7 +241,7 @@ impl prelude::ObjectInterface for Signallable {
                 Signal::builder("stop")
                     .run_last()
                     .return_type::<bool>()
-                    .class_handler(|_tokens, args| {
+                    .class_handler(|args| {
                         let this = args[0usize]
                             .get::<&super::Signallable>()
                             .unwrap_or_else(|e| {
@@ -253,9 +253,9 @@ impl prelude::ObjectInterface for Signallable {
 
                         Some(false.into())
                     })
-                    .accumulator(move |_hint, output, input| {
-                        *output = input.clone();
-                        false
+                    .accumulator(move |_hint, _acc, value| {
+                        // First signal handler wins
+                        std::ops::ControlFlow::Break(value.clone())
                     })
                     .build(),
                 /**
@@ -276,7 +276,7 @@ impl prelude::ObjectInterface for Signallable {
                     .run_last()
                     .param_types([str::static_type()])
                     .return_type::<bool>()
-                    .class_handler(|_tokens, args| {
+                    .class_handler(|args| {
                         let this = args[0usize]
                             .get::<&super::Signallable>()
                             .unwrap_or_else(|e| {
@@ -291,9 +291,9 @@ impl prelude::ObjectInterface for Signallable {
 
                         Some(false.into())
                     })
-                    .accumulator(move |_hint, output, input| {
-                        *output = input.clone();
-                        false
+                    .accumulator(move |_hint, _acc, value| {
+                        // First signal handler wins
+                        std::ops::ControlFlow::Break(value.clone())
                     })
                     .build(),
                 /**
@@ -341,7 +341,7 @@ impl prelude::ObjectInterface for Signallable {
                         gst_webrtc::WebRTCSessionDescription::static_type(),
                     ])
                     .return_type::<gst_webrtc::WebRTCSessionDescription>()
-                    .class_handler(|_tokens, args| {
+                    .class_handler(|args| {
                         let _ = args[0usize]
                             .get::<&super::Signallable>()
                             .unwrap_or_else(|e| {
@@ -358,9 +358,9 @@ impl prelude::ObjectInterface for Signallable {
 
                         Some(desc.clone().into())
                     })
-                    .accumulator(move |_hint, output, input| {
-                        *output = input.clone();
-                        false
+                    .accumulator(move |_hint, _acc, value| {
+                        // First signal handler wins
+                        std::ops::ControlFlow::Break(value.clone())
                     })
                     .build(),
                 /**
@@ -378,7 +378,7 @@ impl prelude::ObjectInterface for Signallable {
                         gst_webrtc::WebRTCSessionDescription::static_type(),
                     ])
                     .return_type::<bool>()
-                    .class_handler(|_tokens, args| {
+                    .class_handler(|args| {
                         let this = args[0usize]
                             .get::<&super::Signallable>()
                             .unwrap_or_else(|e| {
@@ -398,9 +398,9 @@ impl prelude::ObjectInterface for Signallable {
 
                         Some(false.into())
                     })
-                    .accumulator(move |_hint, output, input| {
-                        *output = input.clone();
-                        false
+                    .accumulator(move |_hint, _acc, value| {
+                        // First signal handler wins
+                        std::ops::ControlFlow::Break(value.clone())
                     })
                     .build(),
                 /**
@@ -421,7 +421,7 @@ impl prelude::ObjectInterface for Signallable {
                         String::static_type(),
                     ])
                     .return_type::<bool>()
-                    .class_handler(|_tokens, args| {
+                    .class_handler(|args| {
                         let this = args[0usize]
                             .get::<&super::Signallable>()
                             .unwrap_or_else(|e| {
@@ -445,9 +445,9 @@ impl prelude::ObjectInterface for Signallable {
 
                         Some(false.into())
                     })
-                    .accumulator(move |_hint, output, input| {
-                        *output = input.clone();
-                        false
+                    .accumulator(move |_hint, _acc, value| {
+                        // First signal handler wins
+                        std::ops::ControlFlow::Break(value.clone())
                     })
                     .build(),
                 /**

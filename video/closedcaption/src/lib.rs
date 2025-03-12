@@ -20,6 +20,7 @@ use gst::prelude::*;
 mod ccdetect;
 mod cctost2038anc;
 mod ccutils;
+mod cdpserviceinject;
 mod cea608overlay;
 mod cea608tocea708;
 mod cea608tojson;
@@ -40,6 +41,7 @@ mod st2038ancdemux;
 mod st2038ancmux;
 mod st2038anctocc;
 mod transcriberbin;
+mod translationbin;
 mod tttocea608;
 mod tttocea708;
 mod tttojson;
@@ -63,6 +65,7 @@ fn plugin_init(plugin: &gst::Plugin) -> Result<(), glib::BoolError> {
     cea608tojson::register(plugin)?;
     jsontovtt::register(plugin)?;
     transcriberbin::register(plugin)?;
+    translationbin::register(plugin)?;
     cea608tocea708::register(plugin)?;
     cea708mux::register(plugin)?;
     tttocea708::register(plugin)?;
@@ -71,6 +74,7 @@ fn plugin_init(plugin: &gst::Plugin) -> Result<(), glib::BoolError> {
     st2038ancmux::register(plugin)?;
     st2038anctocc::register(plugin)?;
     cctost2038anc::register(plugin)?;
+    cdpserviceinject::register(plugin)?;
     Ok(())
 }
 

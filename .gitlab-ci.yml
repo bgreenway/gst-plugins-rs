@@ -21,7 +21,6 @@ variables:
   # The tag name is included above from the main repo.
   GSTREAMER_DOC_IMAGE: "registry.freedesktop.org/gstreamer/gstreamer/amd64/fedora:$FEDORA_TAG-main"
   # Use the gstreamer image to trigger the cerbero job, same as the monorepo
-  CERBERO_TRIGGER_IMAGE: "registry.freedesktop.org/gstreamer/gstreamer/amd64/fedora:$FEDORA_TAG-main"
   WINDOWS_BASE: "registry.freedesktop.org/gstreamer/gstreamer-rs/windows"
   WINDOWS_RUST_MINIMUM_IMAGE: "$WINDOWS_BASE:$GST_RS_IMG_WINDOWS_TAG-main-$GST_RS_MSRV"
   WINDOWS_RUST_STABLE_IMAGE: "$WINDOWS_BASE:$GST_RS_IMG_WINDOWS_TAG-main-$GST_RS_STABLE"
@@ -87,14 +86,20 @@ trigger:
 
 .debian:12-stable:
   extends: .debian:12
+  variables:
+    RUST_VERSION: '$GST_RS_STABLE'
   image: "registry.freedesktop.org/gstreamer/gstreamer-rs/debian/bookworm-slim:$GST_RS_STABLE-$GST_RS_IMG_TAG"
 
 .debian:12-msrv:
   extends: .debian:12
+  variables:
+    RUST_VERSION: '$GST_RS_MSRV'
   image: "registry.freedesktop.org/gstreamer/gstreamer-rs/debian/bookworm-slim:$GST_RS_MSRV-$GST_RS_IMG_TAG"
 
 .debian:12-nightly:
   extends: .debian:12
+  variables:
+    RUST_VERSION: 'nightly'
   image: "registry.freedesktop.org/gstreamer/gstreamer-rs/debian/bookworm-slim:nightly-$GST_RS_IMG_TAG"
 
 .cargo test:
@@ -104,23 +109,7 @@ trigger:
     CSOUND_LIB_DIR: '/usr/lib/x86_64-linux-gnu/'
     RUST_BACKTRACE: 'full'
   script:
-    - rustc --version
-    - CARGO_FLAGS="-j${FDO_CI_CONCURRENT:-$(nproc)} --locked --color=always --all --all-targets"
-    - new_report_dir="$CI_PROJECT_DIR/junit_reports"
-    - mkdir -p "$new_report_dir"
-
-
-    - cargo build $CARGO_FLAGS
-    - RUST_BACKTRACE=1 G_DEBUG=fatal_warnings cargo nextest run --profile=ci $CARGO_FLAGS
-    - mv "$CI_PROJECT_DIR/target/nextest/ci/junit.xml" "$new_report_dir/junit-tests-default.xml"
-
-    - cargo build $CARGO_FLAGS --all-features --exclude gst-plugin-gtk4
-    - RUST_BACKTRACE=1 G_DEBUG=fatal_warnings cargo nextest run --profile=ci $CARGO_FLAGS --all-features --exclude gst-plugin-gtk4
-    - mv "$CI_PROJECT_DIR/target/nextest/ci/junit.xml" "$new_report_dir/junit-tests-all.xml"
-
-    - cargo build $CARGO_FLAGS --no-default-features
-    - RUST_BACKTRACE=1 G_DEBUG=fatal_warnings cargo nextest run --profile=ci $CARGO_FLAGS --no-default-features
-    - mv "$CI_PROJECT_DIR/target/nextest/ci/junit.xml" "$new_report_dir/junit-tests-no-default.xml"
+    - ./ci/run-cargo-test.sh
   artifacts:
     reports:
       junit: "junit_reports/*.xml"
@@ -156,6 +145,8 @@ meson shared:
   variables:
     CI_ARTIFACTS_URL: "${CI_PROJECT_URL}/-/jobs/${CI_JOB_ID}/artifacts/raw/"
   script:
+    # Remove cmake because the meson cmake dependency resolver is broken
+    - apt purge cmake -y
     - meson build --default-library=shared --prefix=$(pwd)/install --fatal-meson-warnings
     - ninja -C build install
     - ./ci/check-installed.py install
@@ -172,6 +163,8 @@ meson static:
   extends: .meson
   needs: [ "trigger" ]
   script:
+    # Remove cmake because the meson cmake dependency resolver is broken
+    - apt purge cmake -y
     - meson build --default-library=static --prefix=$(pwd)/install -Dsodium-source=built-in
     - ninja -C build install
     - ./ci/generate-static-test.py test-static-link-all
@@ -303,10 +296,14 @@ test windows msrv:
   extends: '.msvc2019 build'
   image: $WINDOWS_RUST_MINIMUM_IMAGE
   when: 'manual'
+  variables:
+    RUST_VERSION: !reference [variables, "GST_RS_MSRV"]
 
 test windows stable:
   extends: '.msvc2019 build'
   image: "$WINDOWS_RUST_STABLE_IMAGE"
+  variables:
+    RUST_VERSION: !reference [variables, "GST_RS_STABLE"]
 
 rustfmt:
   extends: '.debian:12-stable'
@@ -352,13 +349,11 @@ clippy:
   - "test stable"
   stage: 'extras'
   variables:
+    CLIPPY_LINTS: -D warnings -W unknown-lints
     # csound-sys only looks at /usr/lib and /usr/local top levels
     CSOUND_LIB_DIR: '/usr/lib/x86_64-linux-gnu/'
   script:
-    - CARGO_FLAGS="-j${FDO_CI_CONCURRENT:-$(nproc)} --locked --color=always --all --all-targets"
-    - cargo clippy $CARGO_FLAGS -- -D warnings -A unknown-lints
-    - cargo clippy $CARGO_FLAGS --all-features --exclude gst-plugin-gtk4 -- -D warnings -A unknown-lints
-    - cargo clippy $CARGO_FLAGS --no-default-features -- -D warnings -A unknown-lints
+    - ./ci/run-clippy.sh
 
 deny:
   extends: .debian:12-stable
@@ -383,7 +378,9 @@ outdated:
     - if: '$CI_PIPELINE_SOURCE == "schedule"'
   script:
     - cargo update --color=always
-    - cargo outdated --color=always --root-deps-only --exit-code 1 -v
+    # etherparse 0.17 requires Rust 1.81 or newer
+    # libwebp-sys 0.2 requires Rust 1.85 or newer
+    - cargo outdated --color=always --root-deps-only --ignore etherparse --ignore libwebp-sys2 --exit-code 1 -v
 
 coverage:
   allow_failure: true
@@ -401,7 +398,7 @@ coverage:
   script:
     - CARGO_FLAGS="-j${FDO_CI_CONCURRENT:-$(nproc)} --locked --color=always --all"
 
-    - cargo nextest run --profile=ci $CARGO_FLAGS --all-features --exclude gst-plugin-gtk4
+    - cargo nextest run --profile=ci --no-tests=pass $CARGO_FLAGS --all-features --exclude gst-plugin-gtk4
 
     - new_report_dir="$CI_PROJECT_DIR/junit_reports"
     - mkdir -p "$new_report_dir"
@@ -423,7 +420,7 @@ coverage:
         path: "coverage/cobertura.xml"
 
 cerbero trigger:
-  image: $CERBERO_TRIGGER_IMAGE
+  image: python:alpine
   needs: [ "trigger" ]
   timeout: '4h'
   tags:
@@ -432,7 +429,8 @@ cerbero trigger:
     # We will build this cerbero branch in the cerbero trigger CI
     CERBERO_UPSTREAM_BRANCH: 'main'
   script:
-    - ci/cerbero/trigger_cerbero_pipeline.py
+    - pip install python-gitlab
+    - python ci/cerbero/trigger_cerbero_pipeline.py
   rules:
     # Never run post merge
     - if: '$CI_PROJECT_NAMESPACE == "gstreamer"'

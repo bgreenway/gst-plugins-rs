@@ -21,18 +21,20 @@
  *
  * Since: plugins-rs-0.13.0
  */
-use anyhow::Context;
-use anyhow::{bail, Result};
-use bitstream_io::{BigEndian, BitRead, BitReader, FromBitStream};
-use gst::glib;
-use gst::prelude::*;
-use gst::subclass::prelude::*;
-use std::mem;
-use std::ops::Add;
-use std::ops::ControlFlow;
-use std::sync::Mutex;
+use anyhow::{bail, Context, Result};
 
-use std::sync::LazyLock;
+use bitstream_io::{BigEndian, BitRead, BitReader};
+
+use gst::{glib, prelude::*, subclass::prelude::*};
+
+use std::{
+    collections::BTreeMap,
+    mem,
+    ops::{Add, ControlFlow},
+    sync::{LazyLock, Mutex},
+};
+
+use super::parser::*;
 
 static CAT: LazyLock<gst::DebugCategory> = LazyLock::new(|| {
     gst::DebugCategory::new(
@@ -61,7 +63,7 @@ impl MpegTsPcr {
     fn new(value: u64) -> MpegTsPcr {
         MpegTsPcr {
             value: value % (Self::MAX + 1),
-            wraparound: value / (Self::MAX + 1),
+            wraparound: 1 + value / (Self::MAX + 1),
         }
     }
 
@@ -124,8 +126,76 @@ impl MpegTsPcr {
         self.wraparound * (Self::MAX + 1) + self.value
     }
 
-    fn saturating_sub(self, other: MpegTsPcr) -> MpegTsPcr {
-        MpegTsPcr::new(self.to_units().saturating_sub(other.to_units()))
+    /// Calculates PTS relative to this PCR.
+    fn calculate_pts(self, imp: &MpegTsLiveSource, raw_pts: u64) -> Option<gst::ClockTime> {
+        // PTS and PCR wrap around at the same time as both are
+        // stored as 90kHz 33 bit value, with the PCR being extended
+        // by 8 bit 1/300 units which brings it to 27MHz.
+        //
+        // As such the same wraparound counter can be applied to the PTS
+        // for comparison purposes
+
+        let pts = gst::ClockTime::from_nseconds(
+            raw_pts
+                .mul_div_floor(100_000, 9)
+                .expect("failed to convert"),
+        );
+
+        let pcr_offset = gst::ClockTime::from_nseconds(
+            (self.wraparound * (MpegTsPcr::MAX + 1))
+                .mul_div_floor(1000, 27)
+                .expect("failed to convert"),
+        );
+        let pts = pts + pcr_offset;
+
+        let pcr = gst::ClockTime::from(self);
+
+        let absdiff = pts.absdiff(pcr);
+        // Fast paths, no wraparounds and close to the PCR as it should (< 1s is required by T-STD)
+        let threshold = gst::ClockTime::from_mseconds(1500);
+        if absdiff <= threshold {
+            return Some(pts);
+        }
+
+        // Three options now
+
+        let pcr_wraparound =
+            gst::ClockTime::from_nseconds((MpegTsPcr::MAX + 1).mul_div_ceil(1000, 27).unwrap());
+
+        // 1) PTS has wrapped around already but PCR has not
+        if pts < pcr {
+            let pts = pts + pcr_wraparound;
+            if pts >= pcr && pts - pcr <= threshold {
+                return Some(pcr);
+            }
+        }
+
+        // 2) PCR has wrapped around already but PTS has not
+        if pts > pcr {
+            let pts = pts - pcr_wraparound;
+            if pts <= pcr && pcr - pts <= threshold {
+                return Some(pcr);
+            }
+        }
+
+        // 3) PTS makes no sense in relation to PCR
+        gst::warning!(
+            CAT,
+            imp = imp,
+            "PTS {} too far from last PCR {}",
+            gst::ClockTime::from_nseconds(
+                raw_pts
+                    .mul_div_floor(100_000, 9)
+                    .expect("failed to convert")
+            ),
+            gst::ClockTime::from_nseconds(
+                self.value
+                    .mul_div_floor(1000, 27)
+                    .expect("failed to convert")
+            ),
+        );
+
+        None
     }
 }
 
@@ -160,6 +230,11 @@ impl From<gst::ClockTime> for MpegTsPcr {
 }
 
 #[derive(Default)]
+struct Stream {
+    pes_parser: PESParser,
+}
+
+#[derive(Default)]
 struct State {
     // Controlled source element
     source: Option<gst::Element>,
@@ -167,260 +242,80 @@ struct State {
     // Last observed PCR (for handling wraparound)
     last_seen_pcr: Option<MpegTsPcr>,
 
-    // First observed PCR and associated timestamp
+    // First observed PCR since discont and associated external clock time
     base_pcr: Option<MpegTsPcr>,
-    base_monotonic: Option<gst::ClockTime>,
+    base_external: Option<gst::ClockTime>,
 
     // If the next outgoing packet should have the discont flag set
     discont_pending: bool,
 
-    // Continuity counter for PAT PID
-    pat_cc: Option<u8>,
-    // Pending PAT payload data from last PAT packet
-    pat_pending: Vec<u8>,
-    // Pending data starts on pointer field, otherwise on table header
-    pat_pending_pusi: bool,
-    // PID used for the PMT of the selected program
-    pmt_pid: Option<u16>,
-    // Program number of the selected program
-    pmt_program_num: Option<u16>,
-    // Continuity counter for PMT PID
-    pmt_cc: Option<u8>,
-    // Pending PMT payload data from last PMT packet
-    pmt_pending: Vec<u8>,
-    // Pending data starts on pointer fiel, otherwise on table header
-    pmt_pending_pusi: bool,
-    // PID used for the PCR of the selected program
-    pcr_pid: Option<u16>,
-}
+    // Section parser for PAT
+    pat_parser: SectionParser,
+    // Current PAT, first program is the selected one
+    pat: Option<ProgramAccessTable>,
 
-#[derive(Debug)]
-#[allow(unused)]
-struct PacketHeader {
-    tei: bool,
-    pusi: bool,
-    tp: bool,
-    pid: u16,
-    tsc: u8,
-    afc: u8,
-    cc: u8,
-}
-
-impl FromBitStream for PacketHeader {
-    type Error = anyhow::Error;
-
-    fn from_reader<R: BitRead + ?Sized>(r: &mut R) -> std::result::Result<Self, Self::Error>
-    where
-        Self: Sized,
-    {
-        if r.read_to::<u8>().context("sync_byte")? != 0x47 {
-            bail!("Lost sync");
-        }
-
-        let tei = r.read_bit().context("tei")?;
-        let pusi = r.read_bit().context("pusi")?;
-        let tp = r.read_bit().context("tp")?;
-        let pid = r.read::<u16>(13).context("pid")?;
-
-        let tsc = r.read::<u8>(2).context("tsc")?;
-        let afc = r.read::<u8>(2).context("afc")?;
-        let cc = r.read::<u8>(4).context("cc")?;
-
-        Ok(PacketHeader {
-            tei,
-            pusi,
-            tp,
-            pid,
-            tsc,
-            afc,
-            cc,
-        })
-    }
-}
-
-#[derive(Debug)]
-struct AdaptionField {
-    pcr: Option<u64>,
-    // Add other fields as needed
-}
-
-impl FromBitStream for AdaptionField {
-    type Error = anyhow::Error;
-
-    fn from_reader<R: BitRead + ?Sized>(r: &mut R) -> std::result::Result<Self, Self::Error>
-    where
-        Self: Sized,
-    {
-        r.skip(3).context("flags")?;
-        let pcr_present = r.read_bit().context("pcr_present")?;
-        r.skip(4).context("flags")?;
-
-        // PCR present
-        let pcr = if pcr_present {
-            let pcr = r.read::<u64>(33).context("pcr_base")? * 300;
-            r.skip(6).context("pcr_reserved")?;
-            let pcr = pcr + r.read::<u64>(9).context("pcr_extension")? % 300;
-            Some(pcr)
-        } else {
-            None
-        };
-
-        // Skip all other parts of the adaptation field for now
-
-        Ok(AdaptionField { pcr })
-    }
-}
-
-#[derive(Debug)]
-struct TableHeader {
-    table_id: u8,
-    section_syntax_indicator: bool,
-    section_length: u16,
-}
-
-impl FromBitStream for TableHeader {
-    type Error = anyhow::Error;
-
-    fn from_reader<R: BitRead + ?Sized>(r: &mut R) -> std::result::Result<Self, Self::Error>
-    where
-        Self: Sized,
-    {
-        let table_id = r.read_to::<u8>().context("table_id")?;
-        let section_syntax_indicator = r.read_bit().context("table_syntax_indicator")?;
-        r.skip(5).context("reserved")?;
-        let section_length = r.read::<u16>(10).context("section_length")?;
-
-        Ok(TableHeader {
-            table_id,
-            section_syntax_indicator,
-            section_length,
-        })
-    }
-}
-
-#[derive(Debug)]
-#[allow(unused)]
-struct TableSyntaxSection {
-    table_id_extension: u16,
-    version_number: u8,
-    current_next_indicator: bool,
-    section_number: u8,
-    last_section_number: u8,
-}
-
-impl FromBitStream for TableSyntaxSection {
-    type Error = anyhow::Error;
-
-    fn from_reader<R: BitRead + ?Sized>(r: &mut R) -> std::result::Result<Self, Self::Error>
-    where
-        Self: Sized,
-    {
-        let table_id_extension = r.read_to::<u16>().context("table_id_extension")?;
-        r.skip(2).context("reserved")?;
-        let version_number = r.read::<u8>(5).context("version_number")?;
-        let current_next_indicator = r.read_bit().context("current_next_indicator")?;
-        let section_number = r.read_to::<u8>().context("section_number")?;
-        let last_section_number = r.read_to::<u8>().context("last_section_number")?;
-
-        Ok(TableSyntaxSection {
-            table_id_extension,
-            version_number,
-            current_next_indicator,
-            section_number,
-            last_section_number,
-        })
-    }
-}
-
-#[derive(Debug)]
-struct ProgramAccessTable {
-    program_num: u16,
-    program_map_pid: u16,
-}
-
-impl FromBitStream for ProgramAccessTable {
-    type Error = anyhow::Error;
-
-    fn from_reader<R: BitRead + ?Sized>(r: &mut R) -> std::result::Result<Self, Self::Error>
-    where
-        Self: Sized,
-    {
-        let program_num = r.read_to::<u16>().context("program_num")?;
-        r.skip(3).context("reserved")?;
-        let program_map_pid = r.read::<u16>(13).context("program_map_pid")?;
-
-        Ok(ProgramAccessTable {
-            program_num,
-            program_map_pid,
-        })
-    }
-}
-
-#[derive(Debug)]
-struct ProgramMappingTable {
-    pcr_pid: u16,
-    // Add other fields as needed
-}
-
-impl FromBitStream for ProgramMappingTable {
-    type Error = anyhow::Error;
-
-    fn from_reader<R: BitRead + ?Sized>(r: &mut R) -> std::result::Result<Self, Self::Error>
-    where
-        Self: Sized,
-    {
-        r.skip(3).context("reserved")?;
-        let pcr_pid = r.read::<u16>(13).context("pcr_pid")?;
-
-        Ok(ProgramMappingTable { pcr_pid })
-    }
+    // Section parser for PMT
+    pmt_parser: SectionParser,
+    // Currently selected PMT
+    pmt: Option<ProgramMappingTable>,
+    // Streams of currently selected PMT
+    streams: BTreeMap<u16, Stream>,
 }
 
 impl State {
-    /// Store PCR / monotonic time observation
+    /// Store PCR / internal (monotonic) clock time observation
     fn store_observation(
         &mut self,
         imp: &MpegTsLiveSource,
         pcr: u64,
-        monotonic_time: gst::ClockTime,
+        observation_internal: gst::ClockTime,
     ) {
         // If this is the first PCR we observe:
-        // * Remember the PCR *and* the associated monotonic clock value when capture
-        // * `base_pcr` `base_monotonic`
+        // * Remember the PCR *and* the associated internal (monotonic) == external (scaled
+        //   monotonic) clock value when capture
+        // * Store base_pcr = pcr, base_external = observation_internal
 
         // If we have a PCR we need to store an observation
-        // * Subtract the base PCR from that value and add the base monotonic value
-        //   * observation_monotonic = pcr - base_pcr + base_monotonic
-        // * Store (observation_monotonic, buffer_pts)
+        // * Subtract the base PCR from that value and add the base external clock value
+        //   * observation_external = pcr - base_pcr + base_external
+        // * Store (observation_internal, observation_external)
 
         let new_pcr: MpegTsPcr;
 
-        if let (Some(base_pcr), Some(base_monotonic), Some(last_seen_pcr)) =
-            (self.base_pcr, self.base_monotonic, self.last_seen_pcr)
+        if let (Some(base_pcr), Some(base_external), Some(last_seen_pcr)) =
+            (self.base_pcr, self.base_external, self.last_seen_pcr)
         {
-            gst::trace!(CAT, imp = imp, "pcr:{pcr}, monotonic_time:{monotonic_time}");
+            gst::trace!(
+                CAT,
+                imp = imp,
+                "pcr:{pcr} ({}), observation_internal:{observation_internal}",
+                gst::ClockTime::from_nseconds(
+                    pcr.mul_div_floor(1000, 27).expect("failed to convert")
+                ),
+            );
 
             let mut handled_pcr = MpegTsPcr::new_with_reference(imp, pcr, &last_seen_pcr);
             if let Some(new_pcr) = handled_pcr {
                 // First check if this is more than 1s off from the current clock calibration and
                 // if so consider it a discontinuity too.
-                let (internal, external, num, denom) = imp.external_clock.calibration();
+                let (cinternal, cexternal, cnum, cdenom) = imp.external_clock.calibration();
 
                 let expected_external = gst::Clock::adjust_with_calibration(
-                    monotonic_time,
-                    internal,
-                    external,
-                    num,
-                    denom,
+                    observation_internal,
+                    cinternal,
+                    cexternal,
+                    cnum,
+                    cdenom,
                 );
-                let new_external =
-                    gst::ClockTime::from(new_pcr.saturating_sub(base_pcr)) + base_monotonic;
-                if expected_external.absdiff(new_external) >= gst::ClockTime::SECOND {
+                let observation_external = gst::ClockTime::from(new_pcr)
+                    .saturating_sub(gst::ClockTime::from(base_pcr))
+                    + base_external;
+                if expected_external.absdiff(observation_external) >= gst::ClockTime::SECOND {
                     gst::warning!(
                         CAT,
                         imp = imp,
-                        "New PCR clock estimation {new_external} too far from old estimation {expected_external}: {}",
-                        new_external.into_positive() - expected_external,
+                        "New PCR clock estimation {observation_external} too far from old estimation {expected_external}: {}",
+                        observation_external.into_positive() - expected_external,
                     );
                     handled_pcr = None;
                 }
@@ -432,151 +327,184 @@ impl State {
                     CAT,
                     imp = imp,
                     "Adding new observation internal: {} -> external: {}",
-                    gst::ClockTime::from(new_pcr.saturating_sub(base_pcr)) + base_monotonic,
-                    monotonic_time,
+                    observation_internal,
+                    gst::ClockTime::from(new_pcr).saturating_sub(gst::ClockTime::from(base_pcr))
+                        + base_external,
                 );
                 imp.external_clock.add_observation(
-                    monotonic_time,
-                    gst::ClockTime::from(new_pcr.saturating_sub(base_pcr)) + base_monotonic,
+                    observation_internal,
+                    gst::ClockTime::from(new_pcr).saturating_sub(gst::ClockTime::from(base_pcr))
+                        + base_external,
                 );
             } else {
-                let (internal, external, num, denom) = imp.external_clock.calibration();
-                let scaled_monotonic = gst::Clock::adjust_with_calibration(
-                    monotonic_time,
-                    internal,
-                    external,
-                    num,
-                    denom,
+                let (cinternal, cexternal, cnum, cdenom) = imp.external_clock.calibration();
+                let base_external = gst::Clock::adjust_with_calibration(
+                    observation_internal,
+                    cinternal,
+                    cexternal,
+                    cnum,
+                    cdenom,
                 );
                 gst::warning!(
                     CAT,
                     imp = imp,
-                    "DISCONT detected, Picking new reference times (pcr:{pcr:#?}, monotonic:{monotonic_time}, scaled monotonic:{scaled_monotonic}",
+                    "DISCONT detected, Picking new reference times (pcr:{pcr} ({}), observation_internal:{observation_internal}, base_external:{base_external}",
+                    gst::ClockTime::from_nseconds(
+                        pcr.mul_div_floor(1000, 27).expect("failed to convert")
+                    ),
                 );
                 new_pcr = MpegTsPcr::new(pcr);
                 self.base_pcr = Some(new_pcr);
-                self.base_monotonic = Some(monotonic_time);
+                self.base_external = Some(base_external);
+                imp.external_clock
+                    .set_calibration(observation_internal, base_external, 1, 1);
+                // Hack to flush out observations, we set the window-size to the
+                // same value
+                imp.external_clock
+                    .set_window_size(imp.external_clock.window_size());
                 self.discont_pending = true;
             }
         } else {
+            let (cinternal, cexternal, cnum, cdenom) = imp.external_clock.calibration();
+            let base_external = gst::Clock::adjust_with_calibration(
+                observation_internal,
+                cinternal,
+                cexternal,
+                cnum,
+                cdenom,
+            );
             gst::debug!(
                 CAT,
                 imp = imp,
-                "Picking initial reference times (pcr:{pcr:#?}, monotonic:{monotonic_time}"
+                "Picking initial reference times (pcr:{pcr} ({}), observation_internal:{observation_internal}",
+                gst::ClockTime::from_nseconds(
+                    pcr.mul_div_floor(1000, 27).expect("failed to convert")
+                ),
             );
             new_pcr = MpegTsPcr::new(pcr);
             self.base_pcr = Some(new_pcr);
-            self.base_monotonic = Some(monotonic_time);
+            self.base_external = Some(base_external);
+            imp.external_clock
+                .set_calibration(observation_internal, base_external, 1, 1);
+            // Hack to flush out observations, we set the window-size to the
+            // same value
+            imp.external_clock
+                .set_window_size(imp.external_clock.window_size());
             self.discont_pending = true;
         }
         self.last_seen_pcr = Some(new_pcr);
     }
 
-    /// Parses an MPEG-TS section and updates the internal state
+    /// Parses and handles a section
     fn handle_section(
         &mut self,
         imp: &MpegTsLiveSource,
         header: &PacketHeader,
-        table_header: &TableHeader,
-        slice: &[u8],
+        adaptation_field: Option<&AdaptionField>,
+        payload: &[u8],
     ) -> Result<()> {
-        gst::trace!(
-            CAT,
-            imp = imp,
-            "Parsing section with header {table_header:?}"
-        );
+        // Read PAT or our selected program's PMT
+        if header.pid == 0x00_00 {
+            self.pat_parser.push(header, adaptation_field, payload);
 
-        // Skip non-PAT/PMT
-        if table_header.table_id != 0x00 && table_header.table_id != 0x02
-            || !table_header.section_syntax_indicator
-        {
-            return Ok(());
-        }
-
-        let mut section_reader = BitReader::endian(slice, BigEndian);
-
-        let table_syntax_section = section_reader
-            .parse::<TableSyntaxSection>()
-            .context("section")?;
-
-        gst::trace!(
-            CAT,
-            imp = imp,
-            "Parsing section with table syntax section {table_syntax_section:?}"
-        );
-
-        if header.pid == 0x00_00 && table_header.table_id == 0x00 {
-            // PAT
-            let remaining_length = section_reader.reader().unwrap().len();
-            if remaining_length < 4 {
-                bail!("too short PAT");
-            }
-            let n_pats = (remaining_length - 4) / 4;
-            if n_pats == 0 {
-                gst::warning!(CAT, imp = imp, "No programs in PAT");
-                return Ok(());
-            }
-
-            let mut first = true;
-            let mut warned = false;
-            for idx in 0..n_pats {
-                let pat = section_reader
-                    .parse::<ProgramAccessTable>()
-                    .context("pat")?;
-                gst::trace!(CAT, imp = imp, "Parsed PAT {idx}: {pat:?}");
-                if pat.program_map_pid == 0 {
-                    // Skip NIT
-                } else if first {
-                    first = false;
-                    // Our program we select
-                    if Option::zip(self.pmt_pid, self.pmt_program_num)
-                        .map_or(true, |(pid, prog_num)| {
-                            pid != pat.program_map_pid || prog_num != pat.program_num
-                        })
-                    {
+            loop {
+                match self.pat_parser.parse() {
+                    Ok(Some(Section::ProgramAccessTable {
+                        table_header,
+                        table_syntax_section,
+                        pat,
+                    })) => {
                         gst::trace!(
                             CAT,
                             imp = imp,
-                            "Selecting program with PID {} and program number {}",
-                            pat.program_map_pid,
-                            pat.program_num,
+                            "Parsed PAT: {table_header:?} {table_syntax_section:?} {pat:?}"
                         );
-                        self.pmt_pid = Some(pat.program_map_pid);
-                        self.pmt_program_num = Some(pat.program_num);
-                        self.pmt_pending.clear();
-                        self.pmt_cc = None;
-                        self.pcr_pid = None;
-                        self.last_seen_pcr = None;
+
+                        // Program number 0 is reserved for the NIT
+                        let num_non_nit_pats =
+                            pat.iter().filter(|pat| pat.program_num != 0).count();
+                        if num_non_nit_pats == 0 {
+                            gst::warning!(CAT, imp = imp, "No programs in PAT");
+                            continue;
+                        } else if num_non_nit_pats > 1 {
+                            gst::warning!(
+                                    CAT,
+                                    imp = imp,
+                                    "MPEG-TS stream with multiple programs - timing will be wrong for all but first program",
+                                );
+                        }
+
+                        // Get first non-NIT program here and select that
+                        let selected_pat = pat.iter().find(|pat| pat.program_num != 0).unwrap();
+                        if header.pid == 0x00_00 && Some(selected_pat) != self.pat.as_ref() {
+                            gst::trace!(
+                                CAT,
+                                imp = imp,
+                                "Selecting program with PID {} and program number {}",
+                                selected_pat.program_map_pid,
+                                selected_pat.program_num,
+                            );
+                            self.pat = Some(selected_pat.clone());
+                            self.pmt_parser.clear();
+                            self.pmt = None;
+                            self.streams.clear();
+                            self.last_seen_pcr = None;
+                        }
                     }
-                } else {
-                    // Other programs we ignore
-                    if !warned {
-                        gst::warning!(
+                    Ok(Some(section)) => {
+                        gst::trace!(
                             CAT,
                             imp = imp,
-                            "MPEG-TS stream with multiple programs - timing will be wrong for all but first program",
+                            "Parsed unhandled section {section:?} on PAT PID"
                         );
-                        warned = true;
+                    }
+                    Ok(None) => break,
+                    Err(err) => {
+                        gst::warning!(CAT, imp = imp, "Failed parsing section: {err:?}");
                     }
                 }
             }
-        } else if Some(header.pid) == self.pmt_pid
-            && Some(table_syntax_section.table_id_extension) == self.pmt_program_num
-            && table_header.table_id == 0x02
-        {
-            // PMT
-            let pmt = section_reader
-                .parse::<ProgramMappingTable>()
-                .context("pmt")?;
-            gst::trace!(
-                CAT,
-                imp = imp,
-                "Parsed PMT for selected program number {}: {pmt:?}",
-                table_syntax_section.table_id_extension
-            );
-            if self.pcr_pid.map_or(true, |pcr_pid| pcr_pid != pmt.pcr_pid) {
-                self.pcr_pid = Some(pmt.pcr_pid);
-                self.last_seen_pcr = None;
+        } else if self.pat.as_ref().map(|pat| pat.program_map_pid) == Some(header.pid) {
+            self.pmt_parser.push(header, adaptation_field, payload);
+
+            loop {
+                match self.pmt_parser.parse() {
+                    Ok(Some(Section::ProgramMappingTable {
+                        table_header,
+                        table_syntax_section,
+                        pmt,
+                    })) => {
+                        gst::trace!(
+                            CAT,
+                            imp = imp,
+                            "Parsed PMT: {table_header:?} {table_syntax_section:?} {pmt:?}"
+                        );
+
+                        if self.pat.as_ref().map(|pat| pat.program_num)
+                            == Some(table_syntax_section.table_id_extension)
+                            && self.pmt.as_ref() != Some(&pmt)
+                        {
+                            gst::trace!(CAT, imp = imp, "Selecting PCR PID {}", pmt.pcr_pid);
+                            self.streams.clear();
+                            for pid in &pmt.elementary_pids {
+                                self.streams.insert(*pid, Stream::default());
+                            }
+                            self.pmt = Some(pmt);
+                            self.last_seen_pcr = None;
+                        }
+                    }
+                    Ok(Some(section)) => {
+                        gst::trace!(
+                            CAT,
+                            imp = imp,
+                            "Parsed unhandled section {section:?} on PMT PID"
+                        );
+                    }
+                    Ok(None) => break,
+                    Err(err) => {
+                        gst::warning!(CAT, imp = imp, "Failed parsing section: {err:?}");
+                    }
+                }
             }
         }
 
@@ -604,6 +532,8 @@ impl State {
             return Ok(());
         }
 
+        let mut adaptation_field = None;
+
         // Read adaptation field if present
         if header.afc & 0x2 != 0 {
             let length = reader.read_to::<u8>().context("af_length")? as usize;
@@ -614,22 +544,41 @@ impl State {
             let af = &af[..length];
             reader.skip(8 * length as u32).context("af")?;
 
-            // Parse adaption field and update PCR if it's the PID of our selected program
-            if self.pcr_pid == Some(header.pid) {
-                let mut af_reader = BitReader::endian(af, BigEndian);
-                let adaptation_field = af_reader.parse::<AdaptionField>().context("af")?;
+            // Zero-byte adaption field is valid and can be just skipped over.
+            if !af.is_empty() {
+                // Parse adaption field and update PCR if it's the PID of our selected program
+                if self.pmt.as_ref().map(|pmt| pmt.pcr_pid) == Some(header.pid) {
+                    let mut af_reader = BitReader::endian(af, BigEndian);
+                    let af = af_reader.parse::<AdaptionField>().context("af")?;
 
-                // PCR present
-                if let Some(pcr) = adaptation_field.pcr {
-                    if let Some(monotonic_time) = monotonic_time {
-                        self.store_observation(imp, pcr, monotonic_time);
-                    } else {
-                        gst::warning!(
-                            CAT,
-                            imp = imp,
-                            "Can't handle PCR without packet capture time"
-                        );
+                    // PCR present
+                    if let Some(pcr) = af.pcr {
+                        if af.discontinuity_flag {
+                            gst::debug!(
+                                CAT,
+                                imp = imp,
+                                "Discontinuity signalled, resetting PCR observations"
+                            );
+
+                            self.base_pcr = None;
+                            self.base_external = None;
+                            self.last_seen_pcr = None;
+                        }
+
+                        if let Some(monotonic_time) = monotonic_time {
+                            self.store_observation(imp, pcr, monotonic_time);
+                        } else {
+                            gst::warning!(
+                                CAT,
+                                imp = imp,
+                                "Can't handle PCR without packet capture time"
+                            );
+                        }
+                    } else if af.discontinuity_flag {
+                        gst::debug!(CAT, imp = imp, "Discontinuity signalled");
                     }
+
+                    adaptation_field = Some(af);
                 }
             }
         }
@@ -638,105 +587,72 @@ impl State {
         if header.afc & 0x1 != 0 {
             let new_payload = *reader.reader().unwrap();
 
-            // Read PAT or our selected program's PMT
-            if header.pid == 0x00_00 || self.pmt_pid == Some(header.pid) {
-                let (cc, mut pending, pending_pusi) = if header.pid == 0x00_00 {
-                    (
-                        &mut self.pat_cc,
-                        mem::take(&mut self.pat_pending),
-                        self.pat_pending_pusi,
-                    )
-                } else {
-                    (
-                        &mut self.pmt_cc,
-                        mem::take(&mut self.pmt_pending),
-                        self.pmt_pending_pusi,
-                    )
-                };
-
-                // Clear any pending data if necessary
-                if header.pusi || cc.map_or(true, |cc| (cc + 1) & 0xf != header.cc) {
-                    pending.clear();
-                }
-                *cc = Some(header.cc);
-
-                // Skip packet if this is not the start of a section
-                if !header.pusi && pending.is_empty() {
-                    return Ok(());
+            if header.pid == 0x00_00
+                || self.pat.as_ref().map(|pat| pat.program_map_pid) == Some(header.pid)
+            {
+                self.handle_section(imp, &header, adaptation_field.as_ref(), new_payload)?;
+            } else if let Some(stream) = self.streams.get_mut(&header.pid) {
+                if adaptation_field
+                    .as_ref()
+                    .is_some_and(|af| af.discontinuity_flag)
+                {
+                    gst::debug!(
+                        CAT,
+                        imp = imp,
+                        "Discontinuity signalled for PID {}, forwarding discont",
+                        header.pid,
+                    );
                 }
 
-                // Store payload for parsing, in case it's split over multiple packets
-                pending.extend_from_slice(new_payload);
+                stream
+                    .pes_parser
+                    .push(&header, adaptation_field.as_ref(), new_payload);
 
-                // No payload
-                if pending.is_empty() {
-                    return Ok(());
-                }
-
-                let payload = pending.as_slice();
-                let mut pusi = header.pusi || pending_pusi;
-                let mut payload_reader = BitReader::endian(payload, BigEndian);
                 loop {
-                    let remaining_payload = payload_reader.reader().unwrap();
+                    match stream.pes_parser.parse() {
+                        Ok(Some((_pes_header, optional_pes_header))) => {
+                            if let Some((raw_pts, last_seen_pcr)) = Option::zip(
+                                optional_pes_header.and_then(|o| o.pts),
+                                self.last_seen_pcr,
+                            ) {
+                                let pts = last_seen_pcr.calculate_pts(imp, raw_pts);
+                                if let Some(pts) = pts {
+                                    gst::trace!(
+                                        CAT,
+                                        imp = imp,
+                                        "Got PES packet for PID {} with PTS {}",
+                                        header.pid,
+                                        pts.into_positive()
+                                            - gst::ClockTime::from(MpegTsPcr::new(0)),
+                                    );
+                                } else {
+                                    gst::warning!(
+                                        CAT,
+                                        imp = imp,
+                                        "DISCONT detected in PES PTS for PID {}, forwarding discont",
+                                        header.pid,
+                                    );
 
-                    let table_header;
-                    if pusi {
-                        assert!(!remaining_payload.is_empty());
-                        let pointer_field = remaining_payload[0] as usize;
-                        // Need more data
-                        if payload_reader.reader().unwrap().len() < 1 + pointer_field + 3 {
+                                    // We do not reset the PCR observations here but only
+                                    // forward a discontinuity downstream so the demuxer does
+                                    // not output any of these packets as they would have invalid
+                                    // timestamps
+                                    self.discont_pending = true;
+                                }
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(err) => {
+                            dbg!(&header);
+                            gst::warning!(
+                                CAT,
+                                imp = imp,
+                                "Failed parsing PES packet for PID {}: {err:?}",
+                                header.pid
+                            );
                             break;
                         }
-
-                        // Skip padding
-                        payload_reader.skip(8 + 8 * pointer_field as u32).unwrap();
-                        pusi = false;
-                        // Peek table header, payload_reader stays at beginning of section header
-                        table_header = payload_reader.clone().parse::<TableHeader>().unwrap();
-                    } else if remaining_payload.len() < 3 {
-                        // Need more data for table header
-                        break;
-                    } else {
-                        // Peek table header, payload_reader stays at beginning of section header
-                        table_header = payload_reader.clone().parse::<TableHeader>().unwrap();
                     }
-
-                    // Need more data for this section. payload_reader is still at beginning of
-                    // section header so require 3 extra bytes
-                    let remaining_length = payload_reader.reader().unwrap().len();
-                    if remaining_length < 3 + table_header.section_length as usize {
-                        break;
-                    }
-
-                    // Skip table header
-                    payload_reader.skip(8 * 3).unwrap();
-                    let section =
-                        &payload_reader.reader().unwrap()[..table_header.section_length as usize];
-                    // Skip whole section so the reader is at the beginning of the next section header
-                    payload_reader
-                        .skip(8 * table_header.section_length as u32)
-                        .unwrap();
-
-                    if let Err(err) = self.handle_section(imp, &header, &table_header, section) {
-                        gst::warning!(
-                            CAT,
-                            imp = imp,
-                            "Failed parsing section {table_header:?}: {err:?}"
-                        );
-                    }
-                }
-
-                // Skip all already parsed sections
-                let remaining_length = payload_reader.reader().unwrap().len();
-                let new_pending_range = (pending.len() - remaining_length)..pending.len();
-                pending.copy_within(new_pending_range, 0);
-                pending.resize(remaining_length, 0u8);
-                if header.pid == 0x00_00 {
-                    self.pat_pending = pending;
-                    self.pat_pending_pusi = pusi;
-                } else {
-                    self.pmt_pending = pending;
-                    self.pmt_pending_pusi = pusi;
                 }
             }
 
@@ -917,14 +833,16 @@ impl ObjectSubclass for MpegTsLiveSource {
                     | gst::PadFlags::PROXY_SCHEDULING,
             )
             .build();
-        let internal_clock = glib::Object::builder::<gst::SystemClock>()
+        let internal_clock = gst::Object::builder::<gst::SystemClock>()
+            .name("mpegts-internal-clock")
             .property("clock-type", gst::ClockType::Monotonic)
-            .property("name", "mpegts-internal-clock")
-            .build();
-        let external_clock = glib::Object::builder::<gst::SystemClock>()
+            .build()
+            .unwrap();
+        let external_clock = gst::Object::builder::<gst::SystemClock>()
+            .name("mpegts-live-clock")
             .property("clock-type", gst::ClockType::Monotonic)
-            .property("name", "mpegts-live-clock")
-            .build();
+            .build()
+            .unwrap();
         // Return an instance of our struct
         Self {
             srcpad,
@@ -1122,22 +1040,22 @@ mod tests {
         // Smallest value
         let pcr = MpegTsPcr::new(0);
         assert_eq!(pcr.value, 0);
-        assert_eq!(pcr.wraparound, 0);
+        assert_eq!(pcr.wraparound, 1);
 
         // Biggest (non-wrapped) value
         let mut pcr = MpegTsPcr::new(MpegTsPcr::MAX);
         assert_eq!(pcr.value, MpegTsPcr::MAX);
-        assert_eq!(pcr.wraparound, 0);
+        assert_eq!(pcr.wraparound, 1);
 
         // a 33bit value overflows into 0
         pcr = MpegTsPcr::new((1u64 << 33) * 300);
         assert_eq!(pcr.value, 0);
-        assert_eq!(pcr.wraparound, 1);
+        assert_eq!(pcr.wraparound, 2);
 
         // Adding one to biggest value overflows
         pcr = MpegTsPcr::new(MpegTsPcr::MAX + 1);
         assert_eq!(pcr.value, 0);
-        assert_eq!(pcr.wraparound, 1);
+        assert_eq!(pcr.wraparound, 2);
     }
 
     #[test]

@@ -656,7 +656,7 @@ impl Session {
             // continue to use that or fallback to webrtcbin pad's msid if the
             // peer-producer-id is None.
             let producer_id = if signaller
-                .has_property("producer-peer-id", Some(Option::<String>::static_type()))
+                .has_property_with_type("producer-peer-id", Option::<String>::static_type())
             {
                 signaller
                     .property::<Option<String>>("producer-peer-id")
@@ -1687,7 +1687,51 @@ impl Default for State {
 #[derive(Default)]
 pub struct WebRTCSrc {}
 
-impl ObjectImpl for WebRTCSrc {}
+impl ObjectImpl for WebRTCSrc {
+    fn properties() -> &'static [glib::ParamSpec] {
+        static PROPERTIES: LazyLock<Vec<glib::ParamSpec>> = LazyLock::new(|| {
+            vec![glib::ParamSpecBoolean::builder("connect-to-first-producer")
+                .nick("Connect to first peer")
+                .blurb(
+                    "When enabled, automatically connect to the first peer that becomes available \
+                     if no 'peer-id' is specified.",
+                )
+                .default_value(false)
+                .mutable_ready()
+                .build()]
+        });
+        PROPERTIES.as_ref()
+    }
+
+    fn set_property(&self, _id: usize, value: &glib::Value, pspec: &glib::ParamSpec) {
+        let obj = self.obj();
+        let base = obj.upcast_ref::<super::BaseWebRTCSrc>().imp();
+        match pspec.name() {
+            "connect-to-first-producer" => base
+                .signaller()
+                .downcast::<Signaller>()
+                .unwrap()
+                .imp()
+                .set_connect_to_first_producer(value.get().unwrap()),
+            _ => unimplemented!(),
+        }
+    }
+
+    fn property(&self, _id: usize, pspec: &glib::ParamSpec) -> glib::Value {
+        let obj = self.obj();
+        let base = obj.upcast_ref::<super::BaseWebRTCSrc>().imp();
+        match pspec.name() {
+            "connect-to-first-producer" => base
+                .signaller()
+                .downcast::<Signaller>()
+                .unwrap()
+                .imp()
+                .connect_to_first_producer()
+                .into(),
+            _ => unimplemented!(),
+        }
+    }
+}
 
 impl GstObjectImpl for WebRTCSrc {}
 
@@ -2061,7 +2105,7 @@ pub(super) mod livekit {
                 vec![glib::subclass::Signal::builder("set-track-disabled")
                     .param_types([bool::static_type()])
                     .action()
-                    .class_handler(|_token, values| {
+                    .class_handler(|values| {
                         let pad = values[0]
                             .get::<&super::super::LiveKitWebRTCSrcPad>()
                             .unwrap();

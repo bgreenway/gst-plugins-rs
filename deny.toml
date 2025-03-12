@@ -16,14 +16,15 @@ allow = [
   "MIT",
   "BSD-2-Clause",
   "BSD-3-Clause",
+  "BSD-3-Clause-Clear",
   "ISC",
   "OpenSSL",
   "Zlib",
-  "Unicode-DFS-2016",
   "Unicode-3.0",
   "Apache-2.0",
   "Apache-2.0 WITH LLVM-exception",
   "MPL-2.0",
+  "NCSA",
 ]
 confidence-threshold = 0.8
 
@@ -51,12 +52,6 @@ multiple-versions = "deny"
 highlight = "all"
 wildcards = "allow"
 
-# ignore duplicated crc dependency because ffv1 depends on an old version
-# https://github.com/rust-av/ffv1/issues/21
-[[bans.skip]]
-name = "crc"
-version = "1.8"
-
 # Ignore various duplicated dependencies because librespot depends on an old versions
 [[bans.skip]]
 name = "hermit-abi"
@@ -83,12 +78,6 @@ version = "1.0"
 name = "regex-syntax"
 version = "0.6"
 
-# publicsuffix depends on an older version of idna
-# https://github.com/rushmorem/publicsuffix/pull/39
-[[bans.skip]]
-name = "idna"
-version = "0.3"
-
 # various livekit dependencies depend on an older versions of various crates
 [[bans.skip]]
 name = "itertools"
@@ -114,10 +103,15 @@ version = "0.52"
 name = "windows-result"
 version = "0.1"
 
-# various rav1e / dssim-core depend on an old version of itertools
+# various rav1e / dssim-core depend on old versions of itertools
 [[bans.skip]]
 name = "itertools"
 version = "0.12"
+
+# vvdec-sys uses bindgen 0.70 while aws-lc-sys uses bindgen 0.69
+[[bans.skip]]
+name = "bindgen"
+version = "0.69"
 
 # matchers depends on an old version of regex-automata
 [[bans.skip]]
@@ -166,6 +160,11 @@ version = "0.20"
 name = "tungstenite"
 version = "0.20"
 
+# librespot depends on older tokio-tungstenite
+[[bans.skip]]
+name = "tungstenite"
+version = "0.24"
+
 # Various crates depend on an older version of http
 [[bans.skip]]
 name = "http"
@@ -202,9 +201,6 @@ version = "0.11"
 name = "rustls-pemfile"
 version = "1.0"
 [[bans.skip]]
-name = "winreg"
-version = "0.50"
-[[bans.skip]]
 name = "system-configuration"
 version = "0.5"
 [[bans.skip]]
@@ -240,13 +236,10 @@ version = "6"
 name = "windows-sys"
 version = "0.52"
 
-# derived-into-owned (via pcap-file) depends on old syn / quote
+# derived-into-owned (via pcap-file) depends on old syn
 [[bans.skip]]
 name = "syn"
-version = "0.11"
-[[bans.skip]]
-name = "quote"
-version = "0.3"
+version = "1.0"
 
 # dav1d depends on old system-deps which depends on old cfg-expr
 [[bans.skip]]
@@ -262,6 +255,11 @@ version = "0.22"
 [[bans.skip]]
 name = "tokio-rustls"
 version = "0.24"
+
+# aws-config depends on old aws-smithy-json
+[[bans.skip]]
+name = "aws-smithy-json"
+version = "0.60.7"
 
 # aws SDK depends on older version of various crypto crates
 [[bans.skip]]
@@ -282,6 +280,9 @@ version = "1"
 [[bans.skip]]
 name = "spki"
 version = "0.6"
+[[bans.skip]]
+name = "lru"
+version = "0.12"
 
 # Various crates depend on thiserror 1
 [[bans.skip]]
@@ -291,11 +292,37 @@ version = "1"
 name = "thiserror-impl"
 version = "1"
 
-# cookie_store depends on idna 0.5
-# https://github.com/pfernie/cookie_store/pull/47
+# native-tls depends on old versions
 [[bans.skip]]
-name = "idna"
-version = "0.5"
+name = "security-framework"
+version = "2"
+[[bans.skip]]
+name = "core-foundation"
+version = "0.9"
+
+# Various crates depend on old zerocopy
+[[bans.skip]]
+name = "zerocopy"
+version = "0.7"
+
+# Various crates depend on old wasi
+[[bans.skip]]
+name = "wasi"
+version = "0.11"
+
+# Various crates depend on old rand
+[[bans.skip]]
+name = "rand_core"
+version = "0.6"
+[[bans.skip]]
+name = "rand_chacha"
+version = "0.3"
+[[bans.skip]]
+name = "rand"
+version = "0.8"
+[[bans.skip]]
+name = "getrandom"
+version = "0.2"
 
 [sources]
 unknown-registry = "deny"

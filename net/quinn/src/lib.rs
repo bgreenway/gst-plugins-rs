@@ -20,17 +20,32 @@
 use gst::glib;
 use gst::prelude::*;
 mod common;
+mod quinnquicdemux;
+pub mod quinnquicmeta;
+mod quinnquicmux;
+pub mod quinnquicquery;
 mod quinnquicsink;
 mod quinnquicsrc;
+mod quinnroqdemux;
+mod quinnroqmux;
+mod quinnwtclientsrc;
+mod quinnwtserversink;
 mod utils;
 
 fn plugin_init(plugin: &gst::Plugin) -> Result<(), glib::BoolError> {
+    env_logger::init();
     #[cfg(feature = "doc")]
     {
         common::QuinnQuicRole::static_type().mark_as_plugin_api(gst::PluginAPIFlags::empty());
     }
+    quinnquicdemux::register(plugin)?;
+    quinnquicmux::register(plugin)?;
+    quinnroqmux::register(plugin)?;
+    quinnroqdemux::register(plugin)?;
     quinnquicsink::register(plugin)?;
     quinnquicsrc::register(plugin)?;
+    quinnwtclientsrc::register(plugin)?;
+    quinnwtserversink::register(plugin)?;
 
     Ok(())
 }

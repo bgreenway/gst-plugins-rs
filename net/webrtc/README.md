@@ -76,6 +76,10 @@ it might expose more interfaces to guide and tune the heuristics it employs.
 > beforehand, such as libx264, libvpx and libopusenc, exact names depend
 > on your distribution.
 
+> In order to build `awskvswebrtcsink` you will need to enable the `aws` feature,
+> to build `livekitwebrtcsink` and `livekitwebrtcsrc` you will need to enable the
+> `livekit` feature, using the `--features` argument of `cargo build`.
+
 ``` shell
 cargo build
 npm --prefix gstwebrtc-api/ run build
@@ -136,11 +140,11 @@ Then open a new terminal and run:
 
 ``` shell
 export GST_PLUGIN_PATH=<path-to-gst-plugins-rs>/target/debug:$GST_PLUGIN_PATH
-gst-launch-1.0 playbin uri=gstwebrtc://127.0.0.1:8443?peer-id=[Client ID]
+gst-launch-1.0 playbin3 uri=gstwebrtc://127.0.0.1:8443?peer-id=[Client ID]
 ```
 
 Replacing the "peer-id" value with the previously copied "Client ID" value. You
-should see the playbin element opening a window and showing you the content
+should see the playbin3 element opening a window and showing you the content
 produced by the web page.
 
 ## Configuration
@@ -301,6 +305,12 @@ is displayed:
 
 ## Using the AWS KVS signaller
 
+You will need to build the crate with the `aws` feature enabled:
+
+```
+cargo build --features aws
+```
+
 * Setup AWS Kinesis Video Streams
 
 * Create a channel from the AWS console (<https://us-east-1.console.aws.amazon.com/kinesisvideo/home?region=us-east-1#/signalingChannels/create>)
@@ -393,6 +403,12 @@ Terminating the client will close the session and the client should receive 200 
 ## Using the LiveKit Signaller
 
 Testing the LiveKit signaller can be done by setting up [LiveKit] and creating a room.
+
+You will need to build the crate with the `livekit` feature enabled:
+
+```
+cargo build --features livekit
+```
 
 You can connect either by given the API key and secret:
 

@@ -225,22 +225,21 @@ impl ObjectImpl for HlsCmafSink {
                 glib::subclass::Signal::builder(SIGNAL_GET_INIT_STREAM)
                     .param_types([String::static_type()])
                     .return_type::<Option<gio::OutputStream>>()
-                    .class_handler(|_, args| {
+                    .class_handler(|args| {
                         let elem = args[0].get::<HlsBaseSink>().expect("signal arg");
                         let init_location = args[1].get::<String>().expect("signal arg");
                         let imp = elem.imp();
 
                         Some(imp.new_file_stream(&init_location).ok().to_value())
                     })
-                    .accumulator(|_hint, ret, value| {
+                    .accumulator(|_hint, _acc, value| {
                         // First signal handler wins
-                        *ret = value.clone();
-                        false
+                        std::ops::ControlFlow::Break(value.clone())
                     })
                     .build(),
                 glib::subclass::Signal::builder(SIGNAL_NEW_PLAYLIST)
                     .action()
-                    .class_handler(|_token, args| {
+                    .class_handler(|args| {
                         // Forces hlscmafsink to finish the current playlist and start a new one.
                         // Meant to be used after changing output location at runtime, which would
                         // otherwise require changing playback state to READY to make sure that the
@@ -405,7 +404,7 @@ impl HlsCmafSink {
 
         let playlist = MediaPlaylist {
             version: Some(6),
-            target_duration: target_duration as f32,
+            target_duration: target_duration as u64,
             playlist_type,
             independent_segments: true,
             ..Default::default()

@@ -6,8 +6,7 @@ use gst::prelude::*;
 use tracing::{debug, error, info, trace};
 use url::Url;
 
-use std::pin::Pin;
-use std::sync::Arc;
+use std::{ops::ControlFlow, pin::Pin, sync::Arc, thread, time::Duration};
 
 use gst_plugin_webrtc_protocol::{
     IncomingMessage as ToSignaller, OutgoingMessage as FromSignaller, PeerRole, PeerStatus,
@@ -125,23 +124,18 @@ fn spawn_consumer(
     pipeline.add(&bin).context("Adding consumer bin")?;
 
     let webrtcsrc = gst::ElementFactory::make("webrtcsrc")
-        .build()
-        .context("Creating webrtcsrc")?;
-
-    if args.expect_clock_signalling {
+        .name(
+            meta.as_ref()
+                .map_or_else(|| peer_id.clone(), serde_json::Value::to_string),
+        )
         // Discard retransmission in RFC 7273 mode. See:
         // * https://gitlab.freedesktop.org/gstreamer/gst-plugins-good/-/issues/914
         // * https://gitlab.freedesktop.org/gstreamer/gstreamer/-/issues/1574
-        webrtcsrc.set_property("do-retransmission", false);
-    }
-
-    if !args.audio_codecs.is_empty() {
-        webrtcsrc.set_property("audio-codecs", gst::Array::new(&args.audio_codecs));
-    }
-
-    if !args.video_codecs.is_empty() {
-        webrtcsrc.set_property("video-codecs", gst::Array::new(&args.video_codecs));
-    }
+        .property_if("do-retransmission", false, args.expect_clock_signalling)
+        .property_if_not_empty::<gst::Array>("audio-codecs", &args.audio_codecs)
+        .property_if_not_empty::<gst::Array>("video-codecs", &args.video_codecs)
+        .build()
+        .context("Creating webrtcsrc")?;
 
     bin.add(&webrtcsrc).context("Adding webrtcsrc")?;
 
@@ -151,6 +145,8 @@ fn spawn_consumer(
 
     signaller.connect("webrtcbin-ready", false, {
         let cli_args = args.clone();
+        let peer_id = peer_id.clone();
+        let meta = meta.clone();
         move |args| {
             let webrtcbin = args[2].get::<gst::Element>().unwrap();
             webrtcbin.set_property("latency", cli_args.rtp_latency);
@@ -179,6 +175,60 @@ fn spawn_consumer(
             // configuration is less than 1ms. The synchronization will have rounding errors
             // in the range of the RTP clock rate, i.e. 1/90000s and 1/48000s in this case
             rtpbin.set_property("min-ts-offset", gst::ClockTime::MSECOND);
+
+            // Log a couple of media details
+            rtpbin.call_async({
+                let cli_args = cli_args.clone();
+                let peer_id = peer_id.clone();
+                let meta = meta.clone();
+                move |rtpbin| {
+                    // Wait for actual streaming and clocks to sync
+                    thread::sleep(Duration::from_secs(cli_args.clock_sync_timeout));
+
+                    let _ = rtpbin
+                        .downcast_ref::<gst::Bin>()
+                        .unwrap()
+                        .iterate_all_by_element_factory_name("rtpjitterbuffer")
+                        .foreach(|jbuf| {
+                            let stats = jbuf.property::<gst::Structure>("stats");
+                            // stats.rfc7273-active is available since GStreamer 1.26
+                            let rfc7273_active =
+                                stats.get_optional::<bool>("rfc7273-active").ok().flatten();
+
+                            let ptdemux = jbuf
+                                .static_pad("src")
+                                .unwrap()
+                                .peer()
+                                .expect("rtpptdemux linked at this point")
+                                .parent_element()
+                                .unwrap();
+                            ptdemux.foreach_src_pad(|_, pad| {
+                                if let Some(caps) = pad.current_caps() {
+                                    let s = caps.structure(0).unwrap();
+                                    let ssrc = s.get::<u32>("ssrc").unwrap();
+                                    let mid = s.get::<&str>("a-mid").unwrap();
+                                    let encoding_name = s.get::<&str>("encoding-name").unwrap();
+
+                                    if let Some(rfc7273_active) = rfc7273_active {
+                                        let ts_refclk =
+                                            s.get_optional::<&str>("a-ts-refclk").unwrap();
+                                        let mediaclk =
+                                            s.get_optional::<&str>("a-mediaclk").unwrap();
+                                        info!(
+                                            %peer_id, ?meta, %ssrc, %mid, %encoding_name,
+                                            %rfc7273_active, ?ts_refclk, ?mediaclk,
+                                            "media info"
+                                        );
+                                    } else {
+                                        info!(%peer_id, ?meta, %ssrc, %mid, %encoding_name, "media info");
+                                    }
+                                }
+
+                                ControlFlow::Continue(())
+                            });
+                        });
+                }
+            });
 
             None
         }
@@ -295,7 +345,7 @@ fn spawn_consumer(
     signaller.connect("session-ended", true, {
         let bin = bin.downgrade();
         move |_| {
-            info!(%peer_id, "Session ended");
+            info!(%peer_id, ?meta, "Session ended");
 
             let Some(bin) = bin.upgrade() else {
                 return Some(false.into());
@@ -561,7 +611,7 @@ async fn connect_as_listener(
 
     let mut signaller_tx = Box::pin(ws_tx.sink_err_into::<anyhow::Error>().with(
         |msg: ToSignaller| {
-            future::ok(Message::Text(
+            future::ok(Message::text(
                 serde_json::to_string(&msg).expect("msg is serializable"),
             ))
         },

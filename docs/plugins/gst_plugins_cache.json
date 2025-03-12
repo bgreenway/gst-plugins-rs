@@ -87,6 +87,18 @@
                         "type": "GstValueArray",
                         "writable": true
                     },
+                    "overflow": {
+                        "blurb": "Defines how output audio with a longer duration than input text should be handled",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "clip (0)",
+                        "mutable": "ready",
+                        "readable": true,
+                        "type": "GstAwsOverflow",
+                        "writable": true
+                    },
                     "secret-access-key": {
                         "blurb": "AWS Secret Access Key",
                         "conditionally-available": false,
@@ -109,6 +121,18 @@
                         "mutable": "ready",
                         "readable": true,
                         "type": "gchararray",
+                        "writable": true
+                    },
+                    "ssml-set-max-duration": {
+                        "blurb": "Wrap plain text as SSML and set the max-duration attribute",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "false",
+                        "mutable": "ready",
+                        "readable": true,
+                        "type": "gboolean",
                         "writable": true
                     },
                     "voice-id": {
@@ -1162,6 +1186,16 @@
                         "direction": "src",
                         "presence": "request",
                         "type": "GstTranslateSrcPad"
+                    },
+                    "unsynced_src": {
+                        "caps": "application/x-json:\n",
+                        "direction": "src",
+                        "presence": "always"
+                    },
+                    "unsynced_translate_src_%%u": {
+                        "caps": "application/x-json:\n",
+                        "direction": "src",
+                        "presence": "sometimes"
                     }
                 },
                 "properties": {
@@ -1345,11 +1379,307 @@
                     }
                 },
                 "rank": "none"
+            },
+            "awstranscriber2": {
+                "author": "Mathieu Duponchelle <mathieu@centricular.com>",
+                "description": "Speech to Text filter, using AWS transcribe",
+                "hierarchy": [
+                    "GstAwsTranscriber2",
+                    "GstElement",
+                    "GstObject",
+                    "GInitiallyUnowned",
+                    "GObject"
+                ],
+                "klass": "Audio/Text/Filter",
+                "pad-templates": {
+                    "sink": {
+                        "caps": "audio/x-raw:\n           rate: 48000\n       channels: 1\n         layout: { (string)interleaved, (string)non-interleaved }\n         format: S16LE\n",
+                        "direction": "sink",
+                        "presence": "always"
+                    },
+                    "src": {
+                        "caps": "text/x-raw:\n         format: utf8\n",
+                        "direction": "src",
+                        "presence": "always"
+                    }
+                },
+                "properties": {
+                    "access-key": {
+                        "blurb": "AWS Access Key",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "NULL",
+                        "mutable": "ready",
+                        "readable": true,
+                        "type": "gchararray",
+                        "writable": true
+                    },
+                    "language-code": {
+                        "blurb": "The Language of the Stream, see <https://docs.aws.amazon.com/transcribe/latest/dg/how-streaming-transcription.html> for an up to date list of allowed languages",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "en-US",
+                        "mutable": "ready",
+                        "readable": true,
+                        "type": "gchararray",
+                        "writable": true
+                    },
+                    "latency": {
+                        "blurb": "Amount of milliseconds to allow AWS transcribe",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "1000",
+                        "max": "-1",
+                        "min": "0",
+                        "mutable": "ready",
+                        "readable": true,
+                        "type": "guint",
+                        "writable": true
+                    },
+                    "lateness": {
+                        "blurb": "Amount of milliseconds to introduce as lateness",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "0",
+                        "max": "-1",
+                        "min": "0",
+                        "mutable": "ready",
+                        "readable": true,
+                        "type": "guint",
+                        "writable": true
+                    },
+                    "results-stability": {
+                        "blurb": "Defines how fast results should stabilize",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "low (2)",
+                        "mutable": "ready",
+                        "readable": true,
+                        "type": "GstAwsTranscriberResultStability",
+                        "writable": true
+                    },
+                    "secret-access-key": {
+                        "blurb": "AWS Secret Access Key",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "NULL",
+                        "mutable": "ready",
+                        "readable": true,
+                        "type": "gchararray",
+                        "writable": true
+                    },
+                    "session-id": {
+                        "blurb": "The ID of the transcription session, must be length 36",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "NULL",
+                        "mutable": "ready",
+                        "readable": true,
+                        "type": "gchararray",
+                        "writable": true
+                    },
+                    "session-token": {
+                        "blurb": "AWS temporary Session Token from STS",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "NULL",
+                        "mutable": "ready",
+                        "readable": true,
+                        "type": "gchararray",
+                        "writable": true
+                    },
+                    "vocabulary-filter-method": {
+                        "blurb": "Defines how filtered words will be edited, has no effect when vocabulary-filter-name isn't set",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "mask (0)",
+                        "mutable": "ready",
+                        "readable": true,
+                        "type": "GstAwsTranscriberVocabularyFilterMethod",
+                        "writable": true
+                    },
+                    "vocabulary-filter-name": {
+                        "blurb": "The name of a custom filter vocabulary, see <https://docs.aws.amazon.com/transcribe/latest/help-panel/vocab-filter.html> for more information",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "NULL",
+                        "mutable": "ready",
+                        "readable": true,
+                        "type": "gchararray",
+                        "writable": true
+                    },
+                    "vocabulary-name": {
+                        "blurb": "The name of a custom vocabulary, see <https://docs.aws.amazon.com/transcribe/latest/dg/how-vocabulary.html> for more information",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "NULL",
+                        "mutable": "ready",
+                        "readable": true,
+                        "type": "gchararray",
+                        "writable": true
+                    }
+                },
+                "rank": "none"
+            },
+            "awstranslate": {
+                "author": "Mathieu Duponchelle <mathieu@centricular.com>",
+                "description": "Translates text",
+                "hierarchy": [
+                    "GstAwsTranslate",
+                    "GstElement",
+                    "GstObject",
+                    "GInitiallyUnowned",
+                    "GObject"
+                ],
+                "klass": "Text/Filter",
+                "pad-templates": {
+                    "sink": {
+                        "caps": "text/x-raw:\n         format: utf8\n",
+                        "direction": "sink",
+                        "presence": "always"
+                    },
+                    "src": {
+                        "caps": "text/x-raw:\n         format: utf8\n",
+                        "direction": "src",
+                        "presence": "always"
+                    }
+                },
+                "properties": {
+                    "access-key": {
+                        "blurb": "AWS Access Key",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "NULL",
+                        "mutable": "ready",
+                        "readable": true,
+                        "type": "gchararray",
+                        "writable": true
+                    },
+                    "input-language-code": {
+                        "blurb": "The Language of the input stream",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "en-US",
+                        "mutable": "ready",
+                        "readable": true,
+                        "type": "gchararray",
+                        "writable": true
+                    },
+                    "latency": {
+                        "blurb": "Amount of milliseconds to allow AWS Polly",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "2000",
+                        "max": "-1",
+                        "min": "0",
+                        "mutable": "ready",
+                        "readable": true,
+                        "type": "guint",
+                        "writable": true
+                    },
+                    "output-language-code": {
+                        "blurb": "The Language of the output stream",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "fr-FR",
+                        "mutable": "ready",
+                        "readable": true,
+                        "type": "gchararray",
+                        "writable": true
+                    },
+                    "secret-access-key": {
+                        "blurb": "AWS Secret Access Key",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "NULL",
+                        "mutable": "ready",
+                        "readable": true,
+                        "type": "gchararray",
+                        "writable": true
+                    },
+                    "session-token": {
+                        "blurb": "AWS temporary Session Token from STS",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "NULL",
+                        "mutable": "ready",
+                        "readable": true,
+                        "type": "gchararray",
+                        "writable": true
+                    },
+                    "tokenization-method": {
+                        "blurb": "The tokenization method to apply",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "span-based (1)",
+                        "mutable": "ready",
+                        "readable": true,
+                        "type": "GstAwsTranscriberTranslationTokenizationMethod",
+                        "writable": true
+                    }
+                },
+                "rank": "none"
             }
         },
         "filename": "gstaws",
         "license": "MPL",
         "other-types": {
+            "GstAwsOverflow": {
+                "kind": "enum",
+                "values": [
+                    {
+                        "desc": "Clip",
+                        "name": "clip",
+                        "value": "0"
+                    },
+                    {
+                        "desc": "Overlap",
+                        "name": "overlap",
+                        "value": "1"
+                    },
+                    {
+                        "desc": "Shift",
+                        "name": "shift",
+                        "value": "2"
+                    }
+                ]
+            },
             "GstAwsPollyEngine": {
                 "kind": "enum",
                 "values": [
@@ -2402,7 +2732,17 @@
                         "direction": "src",
                         "presence": "sometimes"
                     },
+                    "audio_%%u": {
+                        "caps": "ANY",
+                        "direction": "src",
+                        "presence": "sometimes"
+                    },
                     "video": {
+                        "caps": "ANY",
+                        "direction": "src",
+                        "presence": "sometimes"
+                    },
+                    "video_%%u": {
                         "caps": "ANY",
                         "direction": "src",
                         "presence": "sometimes"
@@ -2625,6 +2965,24 @@
                 },
                 "rank": "none",
                 "signals": {
+                    "map-streams": {
+                        "args": [
+                            {
+                                "name": "arg0",
+                                "type": "GstStructure"
+                            },
+                            {
+                                "name": "arg1",
+                                "type": "GstStreamCollection"
+                            },
+                            {
+                                "name": "arg2",
+                                "type": "GstStreamCollection"
+                            }
+                        ],
+                        "return-type": "GstStructure",
+                        "when": "last"
+                    },
                     "unblock": {
                         "action": true,
                         "args": [],
@@ -3598,6 +3956,267 @@
         "tracers": {},
         "url": "https://gitlab.freedesktop.org/gstreamer/gst-plugins-rs"
     },
+    "hlsmultivariantsink": {
+        "description": "GStreamer HLS (HTTP Live Streaming) multi-variant sink Plugin",
+        "elements": {
+            "hlsmultivariantsink": {
+                "author": "Sanchayan Maity <sanchayan@asymptotic.io>",
+                "description": "HTTP Live Streaming sink",
+                "hierarchy": [
+                    "GstHlsMultivariantSink",
+                    "GstBin",
+                    "GstElement",
+                    "GstObject",
+                    "GInitiallyUnowned",
+                    "GObject"
+                ],
+                "interfaces": [
+                    "GstChildProxy"
+                ],
+                "klass": "Sink/Muxer",
+                "pad-templates": {
+                    "audio_%%u": {
+                        "caps": "ANY",
+                        "direction": "sink",
+                        "presence": "request",
+                        "type": "HlsMultivariantSinkPad"
+                    },
+                    "video_%%u": {
+                        "caps": "ANY",
+                        "direction": "sink",
+                        "presence": "request",
+                        "type": "HlsMultivariantSinkPad"
+                    }
+                },
+                "properties": {
+                    "max-files": {
+                        "blurb": "Maximum number of files to keep on disk. Once the maximum is reached, old files start to be deleted to make room for new ones.",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "10",
+                        "max": "-1",
+                        "min": "0",
+                        "mutable": "null",
+                        "readable": true,
+                        "type": "guint",
+                        "writable": true
+                    },
+                    "multivariant-playlist-location": {
+                        "blurb": "Location of the multivariant playlist file to write",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "multivariant.m3u8",
+                        "mutable": "null",
+                        "readable": true,
+                        "type": "gchararray",
+                        "writable": true
+                    },
+                    "muxer-type": {
+                        "blurb": "The muxer to use, cmafmux or mpegtsmux, accordingly selects hlssink3 or hlscmafsink",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "cmaf (0)",
+                        "mutable": "null",
+                        "readable": true,
+                        "type": "GstHlsMultivariantSinkMuxerType",
+                        "writable": true
+                    },
+                    "playlist-length": {
+                        "blurb": "Length of HLS playlist. To allow players to conform to section 6.3.3 of the HLS specification, this should be at least 3. If set to 0, the playlist will be infinite.",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "5",
+                        "max": "-1",
+                        "min": "0",
+                        "mutable": "null",
+                        "readable": true,
+                        "type": "guint",
+                        "writable": true
+                    },
+                    "playlist-type": {
+                        "blurb": "The type of the playlist to use. When VOD type is set, the playlist will be live until the pipeline ends execution.",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "unspecified (0)",
+                        "mutable": "null",
+                        "readable": true,
+                        "type": "GstHlsMultivariantSinkPlaylistType",
+                        "writable": true
+                    },
+                    "send-keyframe-requests": {
+                        "blurb": "Send keyframe requests to ensure correct fragmentation. If this is disabled then the input must have keyframes in regular intervals.",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "true",
+                        "mutable": "null",
+                        "readable": true,
+                        "type": "gboolean",
+                        "writable": true
+                    },
+                    "target-duration": {
+                        "blurb": "The target duration in seconds of a segment/file. (0 - disabled, useful for management of segment duration by the streaming server)",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "15",
+                        "max": "-1",
+                        "min": "0",
+                        "mutable": "null",
+                        "readable": true,
+                        "type": "guint",
+                        "writable": true
+                    }
+                },
+                "rank": "none",
+                "signals": {
+                    "delete-fragment": {
+                        "args": [
+                            {
+                                "name": "arg0",
+                                "type": "gchararray"
+                            }
+                        ],
+                        "return-type": "gboolean",
+                        "when": "last"
+                    },
+                    "get-fragment-stream": {
+                        "args": [
+                            {
+                                "name": "arg0",
+                                "type": "gchararray"
+                            }
+                        ],
+                        "return-type": "GOutputStream",
+                        "when": "last"
+                    },
+                    "get-init-stream": {
+                        "args": [
+                            {
+                                "name": "arg0",
+                                "type": "gchararray"
+                            }
+                        ],
+                        "return-type": "GOutputStream",
+                        "when": "last"
+                    },
+                    "get-multivariant-playlist-stream": {
+                        "args": [
+                            {
+                                "name": "arg0",
+                                "type": "gchararray"
+                            }
+                        ],
+                        "return-type": "GOutputStream",
+                        "when": "last"
+                    },
+                    "get-playlist-stream": {
+                        "args": [
+                            {
+                                "name": "arg0",
+                                "type": "gchararray"
+                            }
+                        ],
+                        "return-type": "GOutputStream",
+                        "when": "last"
+                    }
+                }
+            }
+        },
+        "filename": "gsthlsmultivariantsink",
+        "license": "MPL",
+        "other-types": {
+            "GstHlsMultivariantSinkMuxerType": {
+                "kind": "enum",
+                "values": [
+                    {
+                        "desc": "cmaf",
+                        "name": "cmaf",
+                        "value": "0"
+                    },
+                    {
+                        "desc": "mpegts",
+                        "name": "mpegts",
+                        "value": "1"
+                    }
+                ]
+            },
+            "GstHlsMultivariantSinkPlaylistType": {
+                "kind": "enum",
+                "values": [
+                    {
+                        "desc": "Unspecified: The tag `#EXT-X-PLAYLIST-TYPE` won't be present in the playlist during the pipeline processing.",
+                        "name": "unspecified",
+                        "value": "0"
+                    },
+                    {
+                        "desc": "Event: No segments will be removed from the playlist. At the end of the processing, the tag `#EXT-X-ENDLIST` is added to the playlist. The tag `#EXT-X-PLAYLIST-TYPE:EVENT` will be present in the playlist.",
+                        "name": "event",
+                        "value": "1"
+                    },
+                    {
+                        "desc": "Vod: The playlist behaves like the `event` option (a live event), but at the end of the processing, the playlist will be set to `#EXT-X-PLAYLIST-TYPE:VOD`.",
+                        "name": "vod",
+                        "value": "2"
+                    }
+                ]
+            },
+            "HlsMultivariantSinkPad": {
+                "hierarchy": [
+                    "HlsMultivariantSinkPad",
+                    "GstGhostPad",
+                    "GstProxyPad",
+                    "GstPad",
+                    "GstObject",
+                    "GInitiallyUnowned",
+                    "GObject"
+                ],
+                "kind": "object",
+                "properties": {
+                    "alternate-rendition": {
+                        "blurb": "Alternate Rendition",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "variant-stream, is-i-frame=(boolean)false, uri=(string)\"\", bandwidth=(guint64)0, codecs=(string)NULL, audio=(string)NULL, video=(string)NULL;",
+                        "mutable": "ready",
+                        "readable": true,
+                        "type": "GstStructure",
+                        "writable": true
+                    },
+                    "variant": {
+                        "blurb": "Variant Stream",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "variant-stream, is-i-frame=(boolean)false, uri=(string)\"\", bandwidth=(guint64)0, codecs=(string)NULL, audio=(string)NULL, video=(string)NULL;",
+                        "mutable": "ready",
+                        "readable": true,
+                        "type": "GstStructure",
+                        "writable": true
+                    }
+                }
+            }
+        },
+        "package": "gst-plugin-hlsmultivariantsink",
+        "source": "gst-plugin-hlsmultivariantsink",
+        "tracers": {},
+        "url": "https://gitlab.freedesktop.org/gstreamer/gst-plugins-rs"
+    },
     "hlssink3": {
         "description": "GStreamer HLS (HTTP Live Streaming) Plugin",
         "elements": {
@@ -4489,7 +5108,7 @@
                 "klass": "Codec/Muxer",
                 "pad-templates": {
                     "sink_%%u": {
-                        "caps": "video/x-h264:\n  stream-format: { (string)avc, (string)avc3 }\n      alignment: au\n          width: [ 1, 65535 ]\n         height: [ 1, 65535 ]\nvideo/x-h265:\n  stream-format: { (string)hvc1, (string)hev1 }\n      alignment: au\n          width: [ 1, 65535 ]\n         height: [ 1, 65535 ]\nvideo/x-vp8:\n          width: [ 1, 65535 ]\n         height: [ 1, 65535 ]\nvideo/x-vp9:\n        profile: { (string)0, (string)1, (string)2, (string)3 }\n  chroma-format: { (string)4:2:0, (string)4:2:2, (string)4:4:4 }\n bit-depth-luma: { (uint)8, (uint)10, (uint)12 }\nbit-depth-chroma: { (uint)8, (uint)10, (uint)12 }\n          width: [ 1, 65535 ]\n         height: [ 1, 65535 ]\nvideo/x-av1:\n  stream-format: obu-stream\n      alignment: tu\n        profile: { (string)main, (string)high, (string)professional }\n  chroma-format: { (string)4:0:0, (string)4:2:0, (string)4:2:2, (string)4:4:4 }\n bit-depth-luma: { (uint)8, (uint)10, (uint)12 }\nbit-depth-chroma: { (uint)8, (uint)10, (uint)12 }\n          width: [ 1, 65535 ]\n         height: [ 1, 65535 ]\naudio/mpeg:\n    mpegversion: 4\n  stream-format: raw\n       channels: [ 1, 65535 ]\n           rate: [ 1, 2147483647 ]\naudio/x-opus:\nchannel-mapping-family: [ 0, 255 ]\n       channels: [ 1, 8 ]\n           rate: [ 1, 2147483647 ]\naudio/x-flac:\n         framed: true\n       channels: [ 1, 8 ]\n           rate: [ 1, 655350 ]\n",
+                        "caps": "video/x-h264:\n  stream-format: { (string)avc, (string)avc3 }\n      alignment: au\n          width: [ 1, 65535 ]\n         height: [ 1, 65535 ]\nvideo/x-h265:\n  stream-format: { (string)hvc1, (string)hev1 }\n      alignment: au\n          width: [ 1, 65535 ]\n         height: [ 1, 65535 ]\nvideo/x-vp8:\n          width: [ 1, 65535 ]\n         height: [ 1, 65535 ]\nvideo/x-vp9:\n        profile: { (string)0, (string)1, (string)2, (string)3 }\n  chroma-format: { (string)4:2:0, (string)4:2:2, (string)4:4:4 }\n bit-depth-luma: { (uint)8, (uint)10, (uint)12 }\nbit-depth-chroma: { (uint)8, (uint)10, (uint)12 }\n          width: [ 1, 65535 ]\n         height: [ 1, 65535 ]\nvideo/x-av1:\n  stream-format: obu-stream\n      alignment: tu\n        profile: { (string)main, (string)high, (string)professional }\n  chroma-format: { (string)4:0:0, (string)4:2:0, (string)4:2:2, (string)4:4:4 }\n bit-depth-luma: { (uint)8, (uint)10, (uint)12 }\nbit-depth-chroma: { (uint)8, (uint)10, (uint)12 }\n          width: [ 1, 65535 ]\n         height: [ 1, 65535 ]\nvideo/x-raw:\n         format: { IYU2, RGB, BGR, NV12, NV21, RGBA, ARGB, ABGR, BGRA, RGBx, BGRx, Y444, AYUV, GRAY8, GRAY16_BE, GBR, RGBP, BGRP, v308, r210 }\n          width: [ 1, 2147483647 ]\n         height: [ 1, 2147483647 ]\nvideo/x-raw:\n         format: { Y41B, NV16, NV61, Y42B }\n          width: [ 4, 2147483644, 4 ]\n         height: [ 1, 2147483647 ]\nvideo/x-raw:\n         format: { I420, YV12, YUY2, YVYU, UYVY, VYUY }\n          width: [ 4, 2147483644, 4 ]\n         height: [ 2, 2147483646, 2 ]\naudio/mpeg:\n    mpegversion: 4\n  stream-format: raw\n       channels: [ 1, 65535 ]\n           rate: [ 1, 2147483647 ]\naudio/x-opus:\nchannel-mapping-family: [ 0, 255 ]\n       channels: [ 1, 8 ]\n           rate: [ 1, 2147483647 ]\naudio/x-flac:\n         framed: true\n       channels: [ 1, 8 ]\n           rate: [ 1, 655350 ]\n",
                         "direction": "sink",
                         "presence": "request",
                         "type": "GstRsMP4MuxPad"
@@ -4600,6 +5219,18 @@
                 ],
                 "kind": "object",
                 "properties": {
+                    "image-sequence": {
+                        "blurb": "Generate ISO/IEC 23008-12 image sequence instead of video",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "false",
+                        "mutable": "ready",
+                        "readable": true,
+                        "type": "gboolean",
+                        "writable": true
+                    },
                     "trak-timescale": {
                         "blurb": "Timescale to use for the track (units per second, 0 is automatic)",
                         "conditionally-available": false,
@@ -5080,6 +5711,72 @@
     "quinn": {
         "description": "GStreamer Plugin for QUIC",
         "elements": {
+            "quinnquicdemux": {
+                "author": "Sanchayan Maity <sanchayan@asymptotic.io>",
+                "description": "Demultiplexes multiple streams and datagram for QUIC",
+                "hierarchy": [
+                    "GstQuinnQuicDemux",
+                    "GstElement",
+                    "GstObject",
+                    "GInitiallyUnowned",
+                    "GObject"
+                ],
+                "klass": "Source/Network/QUIC",
+                "pad-templates": {
+                    "datagram": {
+                        "caps": "ANY",
+                        "direction": "src",
+                        "presence": "sometimes"
+                    },
+                    "sink": {
+                        "caps": "ANY",
+                        "direction": "sink",
+                        "presence": "always"
+                    },
+                    "stream_%%u": {
+                        "caps": "ANY",
+                        "direction": "src",
+                        "presence": "sometimes"
+                    }
+                },
+                "rank": "none"
+            },
+            "quinnquicmux": {
+                "author": "Sanchayan Maity <sanchayan@asymptotic.io>",
+                "description": "Multiplexes multiple streams and datagram for QUIC",
+                "hierarchy": [
+                    "GstQuinnQuicMux",
+                    "GstAggregator",
+                    "GstElement",
+                    "GstObject",
+                    "GInitiallyUnowned",
+                    "GObject"
+                ],
+                "interfaces": [
+                    "GstChildProxy"
+                ],
+                "klass": "Source/Network/QUIC",
+                "pad-templates": {
+                    "datagram": {
+                        "caps": "ANY",
+                        "direction": "sink",
+                        "presence": "request",
+                        "type": "GstAggregatorPad"
+                    },
+                    "src": {
+                        "caps": "ANY",
+                        "direction": "src",
+                        "presence": "always"
+                    },
+                    "stream_%%u": {
+                        "caps": "ANY",
+                        "direction": "sink",
+                        "presence": "request",
+                        "type": "QuinnQuicMuxPad"
+                    }
+                },
+                "rank": "none"
+            },
             "quinnquicsink": {
                 "author": "Sanchayan Maity <sanchayan@asymptotic.io>",
                 "description": "Send data over the network via QUIC",
@@ -5255,6 +5952,20 @@
                         "type": "guint64",
                         "writable": true
                     },
+                    "max-concurrent-uni-streams": {
+                        "blurb": "Maximum number of incoming unidirectional streams that may be open concurrently",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "32",
+                        "max": "18446744073709551615",
+                        "min": "0",
+                        "mutable": "null",
+                        "readable": true,
+                        "type": "guint64",
+                        "writable": true
+                    },
                     "max-udp-payload-size": {
                         "blurb": "Maximum UDP payload size accepted from peers (excluding UDP and IP overhead)",
                         "conditionally-available": false,
@@ -5331,6 +6042,20 @@
                         "mutable": "null",
                         "readable": true,
                         "type": "gboolean",
+                        "writable": true
+                    },
+                    "send-window": {
+                        "blurb": "Maximum number of bytes to transmit to a peer without acknowledgment",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "10000000",
+                        "max": "18446744073709551615",
+                        "min": "0",
+                        "mutable": "null",
+                        "readable": true,
+                        "type": "guint64",
                         "writable": true
                     },
                     "server-address": {
@@ -5431,6 +6156,7 @@
                 "description": "Receive data over the network via QUIC",
                 "hierarchy": [
                     "GstQuinnQuicSrc",
+                    "GstPushSrc",
                     "GstBaseSrc",
                     "GstElement",
                     "GstObject",
@@ -5575,6 +6301,20 @@
                         "type": "guint64",
                         "writable": true
                     },
+                    "max-concurrent-uni-streams": {
+                        "blurb": "Maximum number of incoming unidirectional streams that may be open concurrently",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "32",
+                        "max": "18446744073709551615",
+                        "min": "0",
+                        "mutable": "null",
+                        "readable": true,
+                        "type": "guint64",
+                        "writable": true
+                    },
                     "max-udp-payload-size": {
                         "blurb": "Maximum UDP payload size accepted from peers (excluding UDP and IP overhead)",
                         "conditionally-available": false,
@@ -5627,6 +6367,20 @@
                         "mutable": "null",
                         "readable": true,
                         "type": "gchararray",
+                        "writable": true
+                    },
+                    "receive-window": {
+                        "blurb": "Maximum number of bytes the peer may transmit across all streams of a connection before becoming blocked",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "4611686018427387903",
+                        "max": "4611686018427387903",
+                        "min": "0",
+                        "mutable": "null",
+                        "readable": true,
+                        "type": "guint64",
                         "writable": true
                     },
                     "role": {
@@ -5703,6 +6457,20 @@
                         "type": "GstStructure",
                         "writable": false
                     },
+                    "stream-receive-window": {
+                        "blurb": "Maximum number of bytes the peer may transmit without ACK on any one stream before becoming blocked",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "1250000",
+                        "max": "4611686018427387903",
+                        "min": "0",
+                        "mutable": "null",
+                        "readable": true,
+                        "type": "guint64",
+                        "writable": true
+                    },
                     "timeout": {
                         "blurb": "Value in seconds to timeout QUIC endpoint requests (0 = No timeout).",
                         "conditionally-available": false,
@@ -5710,6 +6478,410 @@
                         "construct-only": false,
                         "controllable": false,
                         "default": "15",
+                        "max": "3600",
+                        "min": "0",
+                        "mutable": "null",
+                        "readable": true,
+                        "type": "guint",
+                        "writable": true
+                    },
+                    "upper-bound-mtu": {
+                        "blurb": "Upper bound to the max UDP payload size that MTU discovery will search for",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "1452",
+                        "max": "65527",
+                        "min": "1452",
+                        "mutable": "null",
+                        "readable": true,
+                        "type": "guint",
+                        "writable": true
+                    },
+                    "use-datagram": {
+                        "blurb": "Use datagram for lower latency, unreliable messaging",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "false",
+                        "mutable": "null",
+                        "readable": true,
+                        "type": "gboolean",
+                        "writable": true
+                    }
+                },
+                "rank": "marginal"
+            },
+            "quinnroqdemux": {
+                "author": "Sanchayan Maity <sanchayan@asymptotic.io>",
+                "description": "Demultiplexes multiple RTP streams over QUIC",
+                "hierarchy": [
+                    "GstQuinnQuicRtpDemux",
+                    "GstElement",
+                    "GstObject",
+                    "GInitiallyUnowned",
+                    "GObject"
+                ],
+                "klass": "Source/Network/QUIC",
+                "pad-templates": {
+                    "sink": {
+                        "caps": "ANY",
+                        "direction": "sink",
+                        "presence": "always"
+                    },
+                    "src_%%u": {
+                        "caps": "application/x-rtp:\n",
+                        "direction": "src",
+                        "presence": "sometimes"
+                    }
+                },
+                "rank": "none",
+                "signals": {
+                    "request-flow-id-map": {
+                        "args": [
+                            {
+                                "name": "arg0",
+                                "type": "guint64"
+                            }
+                        ],
+                        "return-type": "GstCaps",
+                        "when": "last"
+                    }
+                }
+            },
+            "quinnroqmux": {
+                "author": "Sanchayan Maity <sanchayan@asymptotic.io>",
+                "description": "Multiplexes multiple RTP streams over QUIC",
+                "hierarchy": [
+                    "GstQuinnRoqMux",
+                    "GstAggregator",
+                    "GstElement",
+                    "GstObject",
+                    "GInitiallyUnowned",
+                    "GObject"
+                ],
+                "interfaces": [
+                    "GstChildProxy"
+                ],
+                "klass": "Source/Network/QUIC",
+                "pad-templates": {
+                    "datagram_%%u": {
+                        "caps": "application/x-rtp:\n",
+                        "direction": "sink",
+                        "presence": "request",
+                        "type": "QuinnRoqMuxPad"
+                    },
+                    "src": {
+                        "caps": "ANY",
+                        "direction": "src",
+                        "presence": "always"
+                    },
+                    "stream_%%u": {
+                        "caps": "application/x-rtp:\n",
+                        "direction": "sink",
+                        "presence": "request",
+                        "type": "QuinnRoqMuxPad"
+                    }
+                },
+                "rank": "none"
+            },
+            "quinnwtclientsrc": {
+                "author": "Andoni Morales Alastruey <amorales@fluendo.com>",
+                "description": "Receive data over the network via WebTransport",
+                "hierarchy": [
+                    "GstQuinnWebTransportClientSrc",
+                    "GstPushSrc",
+                    "GstBaseSrc",
+                    "GstElement",
+                    "GstObject",
+                    "GInitiallyUnowned",
+                    "GObject"
+                ],
+                "klass": "Source/Network/QUIC",
+                "pad-templates": {
+                    "src": {
+                        "caps": "ANY",
+                        "direction": "src",
+                        "presence": "always"
+                    }
+                },
+                "properties": {
+                    "certificate-file": {
+                        "blurb": "Path to certificate chain in single file",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "NULL",
+                        "mutable": "null",
+                        "readable": true,
+                        "type": "gchararray",
+                        "writable": true
+                    },
+                    "keep-alive-interval": {
+                        "blurb": "Keeps QUIC connection alive by periodically pinging the server. Value set in ms, 0 disables this feature",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "0",
+                        "max": "18446744073709551615",
+                        "min": "0",
+                        "mutable": "null",
+                        "readable": true,
+                        "type": "guint64",
+                        "writable": true
+                    },
+                    "secure-connection": {
+                        "blurb": "Use certificates for QUIC connection. False: Insecure connection, True: Secure connection.",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "true",
+                        "mutable": "null",
+                        "readable": true,
+                        "type": "gboolean",
+                        "writable": true
+                    },
+                    "stats": {
+                        "blurb": "Connection statistics",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "stats;",
+                        "mutable": "null",
+                        "readable": true,
+                        "type": "GstStructure",
+                        "writable": false
+                    },
+                    "timeout": {
+                        "blurb": "Value in seconds to timeout WebTransport endpoint requests (0 = No timeout).",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "15",
+                        "max": "3600",
+                        "min": "0",
+                        "mutable": "null",
+                        "readable": true,
+                        "type": "guint",
+                        "writable": true
+                    },
+                    "url": {
+                        "blurb": "URL of the HTTP/3 server to connect to.",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "127.0.0.1",
+                        "mutable": "null",
+                        "readable": true,
+                        "type": "gchararray",
+                        "writable": true
+                    }
+                },
+                "rank": "marginal"
+            },
+            "quinnwtserversink": {
+                "author": "Ruben Gonzalez <rgonzalez@fluendo.com>",
+                "description": "Send data over the network via WebTransport",
+                "hierarchy": [
+                    "GstQuinnWebTransportServerSink",
+                    "GstBaseSink",
+                    "GstElement",
+                    "GstObject",
+                    "GInitiallyUnowned",
+                    "GObject"
+                ],
+                "klass": "Source/Network/WebTransport",
+                "pad-templates": {
+                    "sink": {
+                        "caps": "ANY",
+                        "direction": "sink",
+                        "presence": "always"
+                    }
+                },
+                "properties": {
+                    "address": {
+                        "blurb": "Address of the QUIC server e.g. 127.0.0.1",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "127.0.0.1",
+                        "mutable": "null",
+                        "readable": true,
+                        "type": "gchararray",
+                        "writable": true
+                    },
+                    "certificate-file": {
+                        "blurb": "Path to certificate chain in single file",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "NULL",
+                        "mutable": "null",
+                        "readable": true,
+                        "type": "gchararray",
+                        "writable": true
+                    },
+                    "datagram-receive-buffer-size": {
+                        "blurb": "Maximum number of incoming application datagram bytes to buffer",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "1250000",
+                        "max": "18446744073709551615",
+                        "min": "0",
+                        "mutable": "null",
+                        "readable": true,
+                        "type": "guint64",
+                        "writable": true
+                    },
+                    "datagram-send-buffer-size": {
+                        "blurb": "Maximum number of outgoing application datagram bytes to buffer",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "1048576",
+                        "max": "18446744073709551615",
+                        "min": "0",
+                        "mutable": "null",
+                        "readable": true,
+                        "type": "guint64",
+                        "writable": true
+                    },
+                    "drop-buffer-for-datagram": {
+                        "blurb": "Drop buffers when using datagram if buffer size > max datagram size",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "false",
+                        "mutable": "null",
+                        "readable": true,
+                        "type": "gboolean",
+                        "writable": true
+                    },
+                    "initial-mtu": {
+                        "blurb": "Initial value to be used as the maximum UDP payload size",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "1200",
+                        "max": "-1",
+                        "min": "1200",
+                        "mutable": "null",
+                        "readable": true,
+                        "type": "guint",
+                        "writable": true
+                    },
+                    "max-udp-payload-size": {
+                        "blurb": "Maximum UDP payload size accepted from peers (excluding UDP and IP overhead)",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "65527",
+                        "max": "65527",
+                        "min": "1200",
+                        "mutable": "null",
+                        "readable": true,
+                        "type": "guint",
+                        "writable": true
+                    },
+                    "min-mtu": {
+                        "blurb": "Maximum UDP payload size guaranteed to be supported by the network, must be <= initial-mtu",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "1200",
+                        "max": "-1",
+                        "min": "1200",
+                        "mutable": "null",
+                        "readable": true,
+                        "type": "guint",
+                        "writable": true
+                    },
+                    "port": {
+                        "blurb": "Port of the QUIC server e.g. 5000",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "5000",
+                        "max": "65535",
+                        "min": "0",
+                        "mutable": "null",
+                        "readable": true,
+                        "type": "guint",
+                        "writable": true
+                    },
+                    "private-key-file": {
+                        "blurb": "Path to a PKCS8 or RSA private key file",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "NULL",
+                        "mutable": "null",
+                        "readable": true,
+                        "type": "gchararray",
+                        "writable": true
+                    },
+                    "secure-connection": {
+                        "blurb": "Use certificates for QUIC connection. False: Insecure connection, True: Secure connection.",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "true",
+                        "mutable": "null",
+                        "readable": true,
+                        "type": "gboolean",
+                        "writable": true
+                    },
+                    "server-name": {
+                        "blurb": "Name of the QUIC server which is in server certificate in case of server role",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "localhost",
+                        "mutable": "null",
+                        "readable": true,
+                        "type": "gchararray",
+                        "writable": true
+                    },
+                    "stats": {
+                        "blurb": "Connection statistics",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "stats;",
+                        "mutable": "null",
+                        "readable": true,
+                        "type": "GstStructure",
+                        "writable": false
+                    },
+                    "timeout": {
+                        "blurb": "Value in seconds to timeout QUIC endpoint requests (0 = No timeout).",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "0",
                         "max": "3600",
                         "min": "0",
                         "mutable": "null",
@@ -5764,6 +6936,74 @@
                         "value": "1"
                     }
                 ]
+            },
+            "QuinnQuicMuxPad": {
+                "hierarchy": [
+                    "QuinnQuicMuxPad",
+                    "GstAggregatorPad",
+                    "GstPad",
+                    "GstObject",
+                    "GInitiallyUnowned",
+                    "GObject"
+                ],
+                "kind": "object",
+                "properties": {
+                    "priority": {
+                        "blurb": "Priority of the stream",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "0",
+                        "max": "2147483647",
+                        "min": "-2147483648",
+                        "mutable": "null",
+                        "readable": true,
+                        "type": "gint",
+                        "writable": true
+                    }
+                }
+            },
+            "QuinnRoqMuxPad": {
+                "hierarchy": [
+                    "QuinnRoqMuxPad",
+                    "GstAggregatorPad",
+                    "GstPad",
+                    "GstObject",
+                    "GInitiallyUnowned",
+                    "GObject"
+                ],
+                "kind": "object",
+                "properties": {
+                    "flow-id": {
+                        "blurb": "Flow identifier",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "1",
+                        "max": "4611686018427387903",
+                        "min": "1",
+                        "mutable": "null",
+                        "readable": true,
+                        "type": "guint64",
+                        "writable": true
+                    },
+                    "priority": {
+                        "blurb": "Priority of the stream, ignored by datagrams",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "0",
+                        "max": "2147483647",
+                        "min": "-2147483648",
+                        "mutable": "null",
+                        "readable": true,
+                        "type": "gint",
+                        "writable": true
+                    }
+                }
             }
         },
         "package": "gst-plugin-quinn",
@@ -7076,6 +8316,45 @@
                 },
                 "rank": "none"
             },
+            "cdpserviceinject": {
+                "author": "Matthew Waters <matthew@centricular.com>",
+                "description": "Adds or updates CDP Service Description Information",
+                "hierarchy": [
+                    "GstCdpServiceInject",
+                    "GstBaseTransform",
+                    "GstElement",
+                    "GstObject",
+                    "GInitiallyUnowned",
+                    "GObject"
+                ],
+                "klass": "Filter/ClosedCaption",
+                "pad-templates": {
+                    "sink": {
+                        "caps": "closedcaption/x-cea-708:\n         format: cdp\n",
+                        "direction": "sink",
+                        "presence": "always"
+                    },
+                    "src": {
+                        "caps": "closedcaption/x-cea-708:\n         format: cdp\n",
+                        "direction": "src",
+                        "presence": "always"
+                    }
+                },
+                "properties": {
+                    "services": {
+                        "blurb": "List of service information to add or update in the CDP",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "mutable": "playing",
+                        "readable": true,
+                        "type": "GstValueArray",
+                        "writable": true
+                    }
+                },
+                "rank": "none"
+            },
             "cea608overlay": {
                 "author": "Mathieu Duponchelle <mathieu@centricular.com>",
                 "description": "Renders CEA 608 closed caption meta over raw video frames",
@@ -7090,12 +8369,12 @@
                 "long-name": "Cea 608 overlay",
                 "pad-templates": {
                     "sink": {
-                        "caps": "video/x-raw:\n         format: { A444_16LE, A444_16BE, Y416_LE, AYUV64, RGBA64_LE, ARGB64, ARGB64_LE, BGRA64_LE, ABGR64_LE, Y416_BE, RGBA64_BE, ARGB64_BE, BGRA64_BE, ABGR64_BE, A422_16LE, A422_16BE, A420_16LE, A420_16BE, A444_12LE, GBRA_12LE, A444_12BE, GBRA_12BE, Y412_LE, Y412_BE, A422_12LE, A422_12BE, A420_12LE, A420_12BE, A444_10LE, GBRA_10LE, A444_10BE, GBRA_10BE, A422_10LE, A422_10BE, A420_10LE, A420_10BE, BGR10A2_LE, RGB10A2_LE, Y410, A444, GBRA, AYUV, VUYA, RGBA, RBGA, ARGB, BGRA, ABGR, A422, A420, AV12, Y444_16LE, GBR_16LE, Y444_16BE, GBR_16BE, Y216_LE, Y216_BE, v216, P016_LE, P016_BE, Y444_12LE, GBR_12LE, Y444_12BE, GBR_12BE, I422_12LE, I422_12BE, Y212_LE, Y212_BE, I420_12LE, I420_12BE, P012_LE, P012_BE, Y444_10LE, GBR_10LE, Y444_10BE, GBR_10BE, r210, I422_10LE, I422_10BE, NV16_10LE32, Y210, UYVP, v210, I420_10LE, I420_10BE, P010_10LE, NV12_10LE40, NV12_10LE32, P010_10BE, MT2110R, MT2110T, NV12_10BE_8L128, NV12_10LE40_4L4, Y444, BGRP, GBR, RGBP, NV24, v308, IYU2, RGBx, xRGB, BGRx, xBGR, RGB, BGR, Y42B, NV16, NV61, YUY2, YVYU, UYVY, VYUY, I420, YV12, NV12, NV21, NV12_16L32S, NV12_32L32, NV12_4L4, NV12_64Z32, NV12_8L128, Y41B, IYU1, YUV9, YVU9, BGR16, RGB16, BGR15, RGB15, RGB8P, GRAY16_LE, GRAY16_BE, GRAY10_LE32, GRAY8 }\n          width: [ 1, 2147483647 ]\n         height: [ 1, 2147483647 ]\n      framerate: [ 0/1, 2147483647/1 ]\n",
+                        "caps": "video/x-raw:\n         format: { A444_16LE, A444_16BE, Y416_LE, AYUV64, RGBA64_LE, ARGB64, ARGB64_LE, BGRA64_LE, ABGR64_LE, Y416_BE, RGBA64_BE, ARGB64_BE, BGRA64_BE, ABGR64_BE, A422_16LE, A422_16BE, A420_16LE, A420_16BE, A444_12LE, GBRA_12LE, A444_12BE, GBRA_12BE, Y412_LE, Y412_BE, A422_12LE, A422_12BE, A420_12LE, A420_12BE, A444_10LE, GBRA_10LE, A444_10BE, GBRA_10BE, A422_10LE, A422_10BE, A420_10LE, A420_10BE, BGR10A2_LE, RGB10A2_LE, Y410, A444, GBRA, AYUV, VUYA, RGBA, RBGA, ARGB, BGRA, ABGR, A422, A420, AV12, Y444_16LE, GBR_16LE, Y444_16BE, GBR_16BE, Y216_LE, Y216_BE, v216, P016_LE, P016_BE, Y444_12LE, GBR_12LE, Y444_12BE, GBR_12BE, I422_12LE, I422_12BE, Y212_LE, Y212_BE, I420_12LE, I420_12BE, P012_LE, P012_BE, Y444_10LE, GBR_10LE, Y444_10BE, GBR_10BE, r210, I422_10LE, I422_10BE, NV16_10LE32, Y210, UYVP, v210, I420_10LE, I420_10BE, P010_10LE, NV12_10LE40, NV12_10LE32, P010_10BE, MT2110R, MT2110T, NV12_10BE_8L128, NV12_10LE40_4L4, Y444, BGRP, GBR, RGBP, NV24, v308, IYU2, RGBx, xRGB, BGRx, xBGR, RGB, BGR, Y42B, NV16, NV61, YUY2, YVYU, UYVY, VYUY, I420, YV12, NV12, NV21, NV12_16L32S, NV12_32L32, NV12_4L4, NV12_64Z32, NV12_8L128, Y41B, IYU1, YUV9, YVU9, BGR16, RGB16, BGR15, RGB15, RGB8P, GRAY16_LE, GRAY16_BE, GRAY10_LE16, GRAY10_LE32, GRAY8 }\n          width: [ 1, 2147483647 ]\n         height: [ 1, 2147483647 ]\n      framerate: [ 0/1, 2147483647/1 ]\n",
                         "direction": "sink",
                         "presence": "always"
                     },
                     "src": {
-                        "caps": "video/x-raw:\n         format: { A444_16LE, A444_16BE, Y416_LE, AYUV64, RGBA64_LE, ARGB64, ARGB64_LE, BGRA64_LE, ABGR64_LE, Y416_BE, RGBA64_BE, ARGB64_BE, BGRA64_BE, ABGR64_BE, A422_16LE, A422_16BE, A420_16LE, A420_16BE, A444_12LE, GBRA_12LE, A444_12BE, GBRA_12BE, Y412_LE, Y412_BE, A422_12LE, A422_12BE, A420_12LE, A420_12BE, A444_10LE, GBRA_10LE, A444_10BE, GBRA_10BE, A422_10LE, A422_10BE, A420_10LE, A420_10BE, BGR10A2_LE, RGB10A2_LE, Y410, A444, GBRA, AYUV, VUYA, RGBA, RBGA, ARGB, BGRA, ABGR, A422, A420, AV12, Y444_16LE, GBR_16LE, Y444_16BE, GBR_16BE, Y216_LE, Y216_BE, v216, P016_LE, P016_BE, Y444_12LE, GBR_12LE, Y444_12BE, GBR_12BE, I422_12LE, I422_12BE, Y212_LE, Y212_BE, I420_12LE, I420_12BE, P012_LE, P012_BE, Y444_10LE, GBR_10LE, Y444_10BE, GBR_10BE, r210, I422_10LE, I422_10BE, NV16_10LE32, Y210, UYVP, v210, I420_10LE, I420_10BE, P010_10LE, NV12_10LE40, NV12_10LE32, P010_10BE, MT2110R, MT2110T, NV12_10BE_8L128, NV12_10LE40_4L4, Y444, BGRP, GBR, RGBP, NV24, v308, IYU2, RGBx, xRGB, BGRx, xBGR, RGB, BGR, Y42B, NV16, NV61, YUY2, YVYU, UYVY, VYUY, I420, YV12, NV12, NV21, NV12_16L32S, NV12_32L32, NV12_4L4, NV12_64Z32, NV12_8L128, Y41B, IYU1, YUV9, YVU9, BGR16, RGB16, BGR15, RGB15, RGB8P, GRAY16_LE, GRAY16_BE, GRAY10_LE32, GRAY8 }\n          width: [ 1, 2147483647 ]\n         height: [ 1, 2147483647 ]\n      framerate: [ 0/1, 2147483647/1 ]\n",
+                        "caps": "video/x-raw:\n         format: { A444_16LE, A444_16BE, Y416_LE, AYUV64, RGBA64_LE, ARGB64, ARGB64_LE, BGRA64_LE, ABGR64_LE, Y416_BE, RGBA64_BE, ARGB64_BE, BGRA64_BE, ABGR64_BE, A422_16LE, A422_16BE, A420_16LE, A420_16BE, A444_12LE, GBRA_12LE, A444_12BE, GBRA_12BE, Y412_LE, Y412_BE, A422_12LE, A422_12BE, A420_12LE, A420_12BE, A444_10LE, GBRA_10LE, A444_10BE, GBRA_10BE, A422_10LE, A422_10BE, A420_10LE, A420_10BE, BGR10A2_LE, RGB10A2_LE, Y410, A444, GBRA, AYUV, VUYA, RGBA, RBGA, ARGB, BGRA, ABGR, A422, A420, AV12, Y444_16LE, GBR_16LE, Y444_16BE, GBR_16BE, Y216_LE, Y216_BE, v216, P016_LE, P016_BE, Y444_12LE, GBR_12LE, Y444_12BE, GBR_12BE, I422_12LE, I422_12BE, Y212_LE, Y212_BE, I420_12LE, I420_12BE, P012_LE, P012_BE, Y444_10LE, GBR_10LE, Y444_10BE, GBR_10BE, r210, I422_10LE, I422_10BE, NV16_10LE32, Y210, UYVP, v210, I420_10LE, I420_10BE, P010_10LE, NV12_10LE40, NV12_10LE32, P010_10BE, MT2110R, MT2110T, NV12_10BE_8L128, NV12_10LE40_4L4, Y444, BGRP, GBR, RGBP, NV24, v308, IYU2, RGBx, xRGB, BGRx, xBGR, RGB, BGR, Y42B, NV16, NV61, YUY2, YVYU, UYVY, VYUY, I420, YV12, NV12, NV21, NV12_16L32S, NV12_32L32, NV12_4L4, NV12_64Z32, NV12_8L128, Y41B, IYU1, YUV9, YVU9, BGR16, RGB16, BGR15, RGB15, RGB8P, GRAY16_LE, GRAY16_BE, GRAY10_LE16, GRAY10_LE32, GRAY8 }\n          width: [ 1, 2147483647 ]\n         height: [ 1, 2147483647 ]\n      framerate: [ 0/1, 2147483647/1 ]\n",
                         "direction": "src",
                         "presence": "always"
                     }
@@ -7290,12 +8569,12 @@
                 "klass": "Video/Overlay/Subtitle",
                 "pad-templates": {
                     "sink": {
-                        "caps": "video/x-raw:\n         format: { A444_16LE, A444_16BE, Y416_LE, AYUV64, RGBA64_LE, ARGB64, ARGB64_LE, BGRA64_LE, ABGR64_LE, Y416_BE, RGBA64_BE, ARGB64_BE, BGRA64_BE, ABGR64_BE, A422_16LE, A422_16BE, A420_16LE, A420_16BE, A444_12LE, GBRA_12LE, A444_12BE, GBRA_12BE, Y412_LE, Y412_BE, A422_12LE, A422_12BE, A420_12LE, A420_12BE, A444_10LE, GBRA_10LE, A444_10BE, GBRA_10BE, A422_10LE, A422_10BE, A420_10LE, A420_10BE, BGR10A2_LE, RGB10A2_LE, Y410, A444, GBRA, AYUV, VUYA, RGBA, RBGA, ARGB, BGRA, ABGR, A422, A420, AV12, Y444_16LE, GBR_16LE, Y444_16BE, GBR_16BE, Y216_LE, Y216_BE, v216, P016_LE, P016_BE, Y444_12LE, GBR_12LE, Y444_12BE, GBR_12BE, I422_12LE, I422_12BE, Y212_LE, Y212_BE, I420_12LE, I420_12BE, P012_LE, P012_BE, Y444_10LE, GBR_10LE, Y444_10BE, GBR_10BE, r210, I422_10LE, I422_10BE, NV16_10LE32, Y210, UYVP, v210, I420_10LE, I420_10BE, P010_10LE, NV12_10LE40, NV12_10LE32, P010_10BE, MT2110R, MT2110T, NV12_10BE_8L128, NV12_10LE40_4L4, Y444, BGRP, GBR, RGBP, NV24, v308, IYU2, RGBx, xRGB, BGRx, xBGR, RGB, BGR, Y42B, NV16, NV61, YUY2, YVYU, UYVY, VYUY, I420, YV12, NV12, NV21, NV12_16L32S, NV12_32L32, NV12_4L4, NV12_64Z32, NV12_8L128, Y41B, IYU1, YUV9, YVU9, BGR16, RGB16, BGR15, RGB15, RGB8P, GRAY16_LE, GRAY16_BE, GRAY10_LE32, GRAY8 }\n          width: [ 1, 2147483647 ]\n         height: [ 1, 2147483647 ]\n      framerate: [ 0/1, 2147483647/1 ]\n",
+                        "caps": "video/x-raw:\n         format: { A444_16LE, A444_16BE, Y416_LE, AYUV64, RGBA64_LE, ARGB64, ARGB64_LE, BGRA64_LE, ABGR64_LE, Y416_BE, RGBA64_BE, ARGB64_BE, BGRA64_BE, ABGR64_BE, A422_16LE, A422_16BE, A420_16LE, A420_16BE, A444_12LE, GBRA_12LE, A444_12BE, GBRA_12BE, Y412_LE, Y412_BE, A422_12LE, A422_12BE, A420_12LE, A420_12BE, A444_10LE, GBRA_10LE, A444_10BE, GBRA_10BE, A422_10LE, A422_10BE, A420_10LE, A420_10BE, BGR10A2_LE, RGB10A2_LE, Y410, A444, GBRA, AYUV, VUYA, RGBA, RBGA, ARGB, BGRA, ABGR, A422, A420, AV12, Y444_16LE, GBR_16LE, Y444_16BE, GBR_16BE, Y216_LE, Y216_BE, v216, P016_LE, P016_BE, Y444_12LE, GBR_12LE, Y444_12BE, GBR_12BE, I422_12LE, I422_12BE, Y212_LE, Y212_BE, I420_12LE, I420_12BE, P012_LE, P012_BE, Y444_10LE, GBR_10LE, Y444_10BE, GBR_10BE, r210, I422_10LE, I422_10BE, NV16_10LE32, Y210, UYVP, v210, I420_10LE, I420_10BE, P010_10LE, NV12_10LE40, NV12_10LE32, P010_10BE, MT2110R, MT2110T, NV12_10BE_8L128, NV12_10LE40_4L4, Y444, BGRP, GBR, RGBP, NV24, v308, IYU2, RGBx, xRGB, BGRx, xBGR, RGB, BGR, Y42B, NV16, NV61, YUY2, YVYU, UYVY, VYUY, I420, YV12, NV12, NV21, NV12_16L32S, NV12_32L32, NV12_4L4, NV12_64Z32, NV12_8L128, Y41B, IYU1, YUV9, YVU9, BGR16, RGB16, BGR15, RGB15, RGB8P, GRAY16_LE, GRAY16_BE, GRAY10_LE16, GRAY10_LE32, GRAY8 }\n          width: [ 1, 2147483647 ]\n         height: [ 1, 2147483647 ]\n      framerate: [ 0/1, 2147483647/1 ]\n",
                         "direction": "sink",
                         "presence": "always"
                     },
                     "src": {
-                        "caps": "video/x-raw:\n         format: { A444_16LE, A444_16BE, Y416_LE, AYUV64, RGBA64_LE, ARGB64, ARGB64_LE, BGRA64_LE, ABGR64_LE, Y416_BE, RGBA64_BE, ARGB64_BE, BGRA64_BE, ABGR64_BE, A422_16LE, A422_16BE, A420_16LE, A420_16BE, A444_12LE, GBRA_12LE, A444_12BE, GBRA_12BE, Y412_LE, Y412_BE, A422_12LE, A422_12BE, A420_12LE, A420_12BE, A444_10LE, GBRA_10LE, A444_10BE, GBRA_10BE, A422_10LE, A422_10BE, A420_10LE, A420_10BE, BGR10A2_LE, RGB10A2_LE, Y410, A444, GBRA, AYUV, VUYA, RGBA, RBGA, ARGB, BGRA, ABGR, A422, A420, AV12, Y444_16LE, GBR_16LE, Y444_16BE, GBR_16BE, Y216_LE, Y216_BE, v216, P016_LE, P016_BE, Y444_12LE, GBR_12LE, Y444_12BE, GBR_12BE, I422_12LE, I422_12BE, Y212_LE, Y212_BE, I420_12LE, I420_12BE, P012_LE, P012_BE, Y444_10LE, GBR_10LE, Y444_10BE, GBR_10BE, r210, I422_10LE, I422_10BE, NV16_10LE32, Y210, UYVP, v210, I420_10LE, I420_10BE, P010_10LE, NV12_10LE40, NV12_10LE32, P010_10BE, MT2110R, MT2110T, NV12_10BE_8L128, NV12_10LE40_4L4, Y444, BGRP, GBR, RGBP, NV24, v308, IYU2, RGBx, xRGB, BGRx, xBGR, RGB, BGR, Y42B, NV16, NV61, YUY2, YVYU, UYVY, VYUY, I420, YV12, NV12, NV21, NV12_16L32S, NV12_32L32, NV12_4L4, NV12_64Z32, NV12_8L128, Y41B, IYU1, YUV9, YVU9, BGR16, RGB16, BGR15, RGB15, RGB8P, GRAY16_LE, GRAY16_BE, GRAY10_LE32, GRAY8 }\n          width: [ 1, 2147483647 ]\n         height: [ 1, 2147483647 ]\n      framerate: [ 0/1, 2147483647/1 ]\n",
+                        "caps": "video/x-raw:\n         format: { A444_16LE, A444_16BE, Y416_LE, AYUV64, RGBA64_LE, ARGB64, ARGB64_LE, BGRA64_LE, ABGR64_LE, Y416_BE, RGBA64_BE, ARGB64_BE, BGRA64_BE, ABGR64_BE, A422_16LE, A422_16BE, A420_16LE, A420_16BE, A444_12LE, GBRA_12LE, A444_12BE, GBRA_12BE, Y412_LE, Y412_BE, A422_12LE, A422_12BE, A420_12LE, A420_12BE, A444_10LE, GBRA_10LE, A444_10BE, GBRA_10BE, A422_10LE, A422_10BE, A420_10LE, A420_10BE, BGR10A2_LE, RGB10A2_LE, Y410, A444, GBRA, AYUV, VUYA, RGBA, RBGA, ARGB, BGRA, ABGR, A422, A420, AV12, Y444_16LE, GBR_16LE, Y444_16BE, GBR_16BE, Y216_LE, Y216_BE, v216, P016_LE, P016_BE, Y444_12LE, GBR_12LE, Y444_12BE, GBR_12BE, I422_12LE, I422_12BE, Y212_LE, Y212_BE, I420_12LE, I420_12BE, P012_LE, P012_BE, Y444_10LE, GBR_10LE, Y444_10BE, GBR_10BE, r210, I422_10LE, I422_10BE, NV16_10LE32, Y210, UYVP, v210, I420_10LE, I420_10BE, P010_10LE, NV12_10LE40, NV12_10LE32, P010_10BE, MT2110R, MT2110T, NV12_10BE_8L128, NV12_10LE40_4L4, Y444, BGRP, GBR, RGBP, NV24, v308, IYU2, RGBx, xRGB, BGRx, xBGR, RGB, BGR, Y42B, NV16, NV61, YUY2, YVYU, UYVY, VYUY, I420, YV12, NV12, NV21, NV12_16L32S, NV12_32L32, NV12_4L4, NV12_64Z32, NV12_8L128, Y41B, IYU1, YUV9, YVU9, BGR16, RGB16, BGR15, RGB15, RGB8P, GRAY16_LE, GRAY16_BE, GRAY10_LE16, GRAY10_LE32, GRAY8 }\n          width: [ 1, 2147483647 ]\n         height: [ 1, 2147483647 ]\n      framerate: [ 0/1, 2147483647/1 ]\n",
                         "direction": "src",
                         "presence": "always"
                     }
@@ -7313,6 +8592,34 @@
                         "mutable": "playing",
                         "readable": true,
                         "type": "gint",
+                        "writable": true
+                    },
+                    "safe-title-height": {
+                        "blurb": "Ratio of the video height to use as the safe area for caption display",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "0.8",
+                        "max": "1",
+                        "min": "0",
+                        "mutable": "playing",
+                        "readable": true,
+                        "type": "gfloat",
+                        "writable": true
+                    },
+                    "safe-title-width": {
+                        "blurb": "Ratio of the video width to use as the safe area for caption display",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "0.8",
+                        "max": "1",
+                        "min": "0",
+                        "mutable": "playing",
+                        "readable": true,
+                        "type": "gfloat",
                         "writable": true
                     },
                     "service": {
@@ -7664,10 +8971,50 @@
                         "presence": "sometimes",
                         "type": "GstTranscriberSrcPad"
                     },
+                    "src_subtitle_%%s": {
+                        "caps": "text/x-raw:\n",
+                        "direction": "src",
+                        "presence": "sometimes"
+                    },
+                    "src_subtitle_%%s_%%u": {
+                        "caps": "text/x-raw:\n",
+                        "direction": "src",
+                        "presence": "sometimes"
+                    },
+                    "src_synthesis_%%s": {
+                        "caps": "audio/x-raw:\n",
+                        "direction": "src",
+                        "presence": "sometimes"
+                    },
+                    "src_synthesis_%%s_%%u": {
+                        "caps": "audio/x-raw:\n",
+                        "direction": "src",
+                        "presence": "sometimes"
+                    },
                     "src_video": {
                         "caps": "video/x-raw(ANY):\n",
                         "direction": "src",
                         "presence": "always"
+                    },
+                    "unsynced_src": {
+                        "caps": "application/x-json:\n",
+                        "direction": "src",
+                        "presence": "sometimes"
+                    },
+                    "unsynced_src_%%u": {
+                        "caps": "application/x-json:\n",
+                        "direction": "src",
+                        "presence": "sometimes"
+                    },
+                    "unsynced_translate_src_%%u": {
+                        "caps": "application/x-json:\n",
+                        "direction": "src",
+                        "presence": "sometimes"
+                    },
+                    "unsynced_translate_src_%%u_%%u": {
+                        "caps": "application/x-json:\n",
+                        "direction": "src",
+                        "presence": "sometimes"
                     }
                 },
                 "properties": {
@@ -7709,18 +9056,6 @@
                         "type": "GstCaps",
                         "writable": true
                     },
-                    "language-code": {
-                        "blurb": "The language of the input stream",
-                        "conditionally-available": false,
-                        "construct": false,
-                        "construct-only": false,
-                        "controllable": false,
-                        "default": "en-US",
-                        "mutable": "playing",
-                        "readable": true,
-                        "type": "gchararray",
-                        "writable": true
-                    },
                     "latency": {
                         "blurb": "Amount of milliseconds to allow the transcriber",
                         "conditionally-available": false,
@@ -7749,18 +9084,6 @@
                         "type": "guint",
                         "writable": true
                     },
-                    "mode": {
-                        "blurb": "Which closed caption mode to operate in",
-                        "conditionally-available": false,
-                        "construct": false,
-                        "construct-only": false,
-                        "controllable": false,
-                        "default": "roll-up2 (2)",
-                        "mutable": "playing",
-                        "readable": true,
-                        "type": "GstTtToCea608Mode",
-                        "writable": true
-                    },
                     "mux-method": {
                         "blurb": "The method for muxing multiple transcription streams",
                         "conditionally-available": false,
@@ -7771,17 +9094,6 @@
                         "mutable": "null",
                         "readable": true,
                         "type": "GstTranscriberBinMuxMethod",
-                        "writable": true
-                    },
-                    "transcriber": {
-                        "blurb": "The transcriber element to use",
-                        "conditionally-available": false,
-                        "construct": false,
-                        "construct-only": false,
-                        "controllable": false,
-                        "mutable": "ready",
-                        "readable": true,
-                        "type": "GstElement",
                         "writable": true
                     },
                     "translate-latency": {
@@ -7797,17 +9109,107 @@
                         "readable": true,
                         "type": "guint",
                         "writable": true
+                    }
+                },
+                "rank": "none"
+            },
+            "translationbin": {
+                "author": "Mathieu Duponchelle <mathieu@centricular.com>",
+                "description": "Transcribes audio and translates it",
+                "hierarchy": [
+                    "GstTranslationBin",
+                    "GstBin",
+                    "GstElement",
+                    "GstObject",
+                    "GInitiallyUnowned",
+                    "GObject"
+                ],
+                "interfaces": [
+                    "GstChildProxy"
+                ],
+                "klass": "Audio / Text",
+                "pad-templates": {
+                    "sink": {
+                        "caps": "audio/x-raw:\n",
+                        "direction": "sink",
+                        "presence": "always"
                     },
-                    "translation-languages": {
-                        "blurb": "A map of language codes to caption channels, e.g. translation-languages=\"languages, transcript={CC1, 708_1}, fr={708_2, CC3}\" will map the French translation to CC1/service 1 and the original transcript to CC3/service 2",
+                    "src": {
+                        "caps": "text/x-raw:\n         format: utf8\n",
+                        "direction": "src",
+                        "presence": "always"
+                    },
+                    "translate_src_%%u": {
+                        "caps": "text/x-raw:\n         format: utf8\n",
+                        "direction": "src",
+                        "presence": "request",
+                        "type": "GstTranslationBinTranslationSrcPad"
+                    }
+                },
+                "properties": {
+                    "language-code": {
+                        "blurb": "The language of the input stream",
                         "conditionally-available": false,
-                        "construct": true,
+                        "construct": false,
                         "construct-only": false,
                         "controllable": false,
-                        "default": "languages, transcript=(string)cc1;",
-                        "mutable": "playing",
+                        "default": "en-US",
+                        "mutable": "ready",
                         "readable": true,
-                        "type": "GstStructure",
+                        "type": "gchararray",
+                        "writable": true
+                    },
+                    "lateness": {
+                        "blurb": "Amount of milliseconds to offset transcription by",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "0",
+                        "max": "-1",
+                        "min": "0",
+                        "mutable": "ready",
+                        "readable": true,
+                        "type": "guint",
+                        "writable": true
+                    },
+                    "transcribe-latency": {
+                        "blurb": "Amount of milliseconds to allow for transcription",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "1000",
+                        "max": "-1",
+                        "min": "0",
+                        "mutable": "ready",
+                        "readable": true,
+                        "type": "guint",
+                        "writable": true
+                    },
+                    "transcriber": {
+                        "blurb": "The transcriber element to use",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "mutable": "ready",
+                        "readable": true,
+                        "type": "GstElement",
+                        "writable": true
+                    },
+                    "translate-latency": {
+                        "blurb": "Amount of milliseconds to allow for translation",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "500",
+                        "max": "-1",
+                        "min": "0",
+                        "mutable": "ready",
+                        "readable": true,
+                        "type": "guint",
                         "writable": true
                     }
                 },
@@ -8143,6 +9545,17 @@
                         "type": "gchararray",
                         "writable": true
                     },
+                    "language-filters": {
+                        "blurb": "A map of language codes to bin descriptions, e.g. text-filters=\"languages, fr=regex\" will filter words out of the transcriber through the regex element",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "mutable": "playing",
+                        "readable": true,
+                        "type": "GstStructure",
+                        "writable": true
+                    },
                     "mode": {
                         "blurb": "Which closed caption mode to operate in",
                         "conditionally-available": false,
@@ -8167,6 +9580,28 @@
                         "type": "gboolean",
                         "writable": true
                     },
+                    "subtitle-languages": {
+                        "blurb": "A map of language codes to bin descriptions, e.g. subtitle-languages=\"languages, fr=textwrap lines=2 accumulate-time=5000000000\" will use the textwrap element before outputting the subtitles",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "mutable": "playing",
+                        "readable": true,
+                        "type": "GstStructure",
+                        "writable": true
+                    },
+                    "synthesis-languages": {
+                        "blurb": "A map of language codes to bin descriptions, e.g. synthesis-languages=\"languages, fr=awspolly\" will use the awspolly element to synthesize speech from French translations",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "mutable": "playing",
+                        "readable": true,
+                        "type": "GstStructure",
+                        "writable": true
+                    },
                     "transcriber": {
                         "blurb": "The transcriber element to use",
                         "conditionally-available": false,
@@ -8176,6 +9611,17 @@
                         "mutable": "ready",
                         "readable": true,
                         "type": "GstElement",
+                        "writable": true
+                    },
+                    "transcription-mix-matrix": {
+                        "blurb": "Initial transformation matrix for the transcriber audioconvert",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "mutable": "ready",
+                        "readable": true,
+                        "type": "GstValueArray",
                         "writable": true
                     },
                     "translation-languages": {
@@ -8203,6 +9649,43 @@
                     "GObject"
                 ],
                 "kind": "object"
+            },
+            "GstTranslationBinTranslationSrcPad": {
+                "hierarchy": [
+                    "GstTranslationBinTranslationSrcPad",
+                    "GstGhostPad",
+                    "GstProxyPad",
+                    "GstPad",
+                    "GstObject",
+                    "GInitiallyUnowned",
+                    "GObject"
+                ],
+                "kind": "object",
+                "properties": {
+                    "language-code": {
+                        "blurb": "The language of the output stream",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "fr-FR",
+                        "mutable": "null",
+                        "readable": true,
+                        "type": "gchararray",
+                        "writable": true
+                    },
+                    "translator": {
+                        "blurb": "The translator element in use",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "mutable": "null",
+                        "readable": true,
+                        "type": "GstElement",
+                        "writable": false
+                    }
+                }
             },
             "GstTtToCea608Mode": {
                 "kind": "enum",
@@ -8587,12 +10070,12 @@
                 "long-name": "ONVIF Metadata overlay",
                 "pad-templates": {
                     "sink": {
-                        "caps": "video/x-raw:\n         format: { A444_16LE, A444_16BE, Y416_LE, AYUV64, RGBA64_LE, ARGB64, ARGB64_LE, BGRA64_LE, ABGR64_LE, Y416_BE, RGBA64_BE, ARGB64_BE, BGRA64_BE, ABGR64_BE, A422_16LE, A422_16BE, A420_16LE, A420_16BE, A444_12LE, GBRA_12LE, A444_12BE, GBRA_12BE, Y412_LE, Y412_BE, A422_12LE, A422_12BE, A420_12LE, A420_12BE, A444_10LE, GBRA_10LE, A444_10BE, GBRA_10BE, A422_10LE, A422_10BE, A420_10LE, A420_10BE, BGR10A2_LE, RGB10A2_LE, Y410, A444, GBRA, AYUV, VUYA, RGBA, RBGA, ARGB, BGRA, ABGR, A422, A420, AV12, Y444_16LE, GBR_16LE, Y444_16BE, GBR_16BE, Y216_LE, Y216_BE, v216, P016_LE, P016_BE, Y444_12LE, GBR_12LE, Y444_12BE, GBR_12BE, I422_12LE, I422_12BE, Y212_LE, Y212_BE, I420_12LE, I420_12BE, P012_LE, P012_BE, Y444_10LE, GBR_10LE, Y444_10BE, GBR_10BE, r210, I422_10LE, I422_10BE, NV16_10LE32, Y210, UYVP, v210, I420_10LE, I420_10BE, P010_10LE, NV12_10LE40, NV12_10LE32, P010_10BE, MT2110R, MT2110T, NV12_10BE_8L128, NV12_10LE40_4L4, Y444, BGRP, GBR, RGBP, NV24, v308, IYU2, RGBx, xRGB, BGRx, xBGR, RGB, BGR, Y42B, NV16, NV61, YUY2, YVYU, UYVY, VYUY, I420, YV12, NV12, NV21, NV12_16L32S, NV12_32L32, NV12_4L4, NV12_64Z32, NV12_8L128, Y41B, IYU1, YUV9, YVU9, BGR16, RGB16, BGR15, RGB15, RGB8P, GRAY16_LE, GRAY16_BE, GRAY10_LE32, GRAY8 }\n          width: [ 1, 2147483647 ]\n         height: [ 1, 2147483647 ]\n      framerate: [ 0/1, 2147483647/1 ]\n",
+                        "caps": "video/x-raw:\n         format: { A444_16LE, A444_16BE, Y416_LE, AYUV64, RGBA64_LE, ARGB64, ARGB64_LE, BGRA64_LE, ABGR64_LE, Y416_BE, RGBA64_BE, ARGB64_BE, BGRA64_BE, ABGR64_BE, A422_16LE, A422_16BE, A420_16LE, A420_16BE, A444_12LE, GBRA_12LE, A444_12BE, GBRA_12BE, Y412_LE, Y412_BE, A422_12LE, A422_12BE, A420_12LE, A420_12BE, A444_10LE, GBRA_10LE, A444_10BE, GBRA_10BE, A422_10LE, A422_10BE, A420_10LE, A420_10BE, BGR10A2_LE, RGB10A2_LE, Y410, A444, GBRA, AYUV, VUYA, RGBA, RBGA, ARGB, BGRA, ABGR, A422, A420, AV12, Y444_16LE, GBR_16LE, Y444_16BE, GBR_16BE, Y216_LE, Y216_BE, v216, P016_LE, P016_BE, Y444_12LE, GBR_12LE, Y444_12BE, GBR_12BE, I422_12LE, I422_12BE, Y212_LE, Y212_BE, I420_12LE, I420_12BE, P012_LE, P012_BE, Y444_10LE, GBR_10LE, Y444_10BE, GBR_10BE, r210, I422_10LE, I422_10BE, NV16_10LE32, Y210, UYVP, v210, I420_10LE, I420_10BE, P010_10LE, NV12_10LE40, NV12_10LE32, P010_10BE, MT2110R, MT2110T, NV12_10BE_8L128, NV12_10LE40_4L4, Y444, BGRP, GBR, RGBP, NV24, v308, IYU2, RGBx, xRGB, BGRx, xBGR, RGB, BGR, Y42B, NV16, NV61, YUY2, YVYU, UYVY, VYUY, I420, YV12, NV12, NV21, NV12_16L32S, NV12_32L32, NV12_4L4, NV12_64Z32, NV12_8L128, Y41B, IYU1, YUV9, YVU9, BGR16, RGB16, BGR15, RGB15, RGB8P, GRAY16_LE, GRAY16_BE, GRAY10_LE16, GRAY10_LE32, GRAY8 }\n          width: [ 1, 2147483647 ]\n         height: [ 1, 2147483647 ]\n      framerate: [ 0/1, 2147483647/1 ]\n",
                         "direction": "sink",
                         "presence": "always"
                     },
                     "src": {
-                        "caps": "video/x-raw:\n         format: { A444_16LE, A444_16BE, Y416_LE, AYUV64, RGBA64_LE, ARGB64, ARGB64_LE, BGRA64_LE, ABGR64_LE, Y416_BE, RGBA64_BE, ARGB64_BE, BGRA64_BE, ABGR64_BE, A422_16LE, A422_16BE, A420_16LE, A420_16BE, A444_12LE, GBRA_12LE, A444_12BE, GBRA_12BE, Y412_LE, Y412_BE, A422_12LE, A422_12BE, A420_12LE, A420_12BE, A444_10LE, GBRA_10LE, A444_10BE, GBRA_10BE, A422_10LE, A422_10BE, A420_10LE, A420_10BE, BGR10A2_LE, RGB10A2_LE, Y410, A444, GBRA, AYUV, VUYA, RGBA, RBGA, ARGB, BGRA, ABGR, A422, A420, AV12, Y444_16LE, GBR_16LE, Y444_16BE, GBR_16BE, Y216_LE, Y216_BE, v216, P016_LE, P016_BE, Y444_12LE, GBR_12LE, Y444_12BE, GBR_12BE, I422_12LE, I422_12BE, Y212_LE, Y212_BE, I420_12LE, I420_12BE, P012_LE, P012_BE, Y444_10LE, GBR_10LE, Y444_10BE, GBR_10BE, r210, I422_10LE, I422_10BE, NV16_10LE32, Y210, UYVP, v210, I420_10LE, I420_10BE, P010_10LE, NV12_10LE40, NV12_10LE32, P010_10BE, MT2110R, MT2110T, NV12_10BE_8L128, NV12_10LE40_4L4, Y444, BGRP, GBR, RGBP, NV24, v308, IYU2, RGBx, xRGB, BGRx, xBGR, RGB, BGR, Y42B, NV16, NV61, YUY2, YVYU, UYVY, VYUY, I420, YV12, NV12, NV21, NV12_16L32S, NV12_32L32, NV12_4L4, NV12_64Z32, NV12_8L128, Y41B, IYU1, YUV9, YVU9, BGR16, RGB16, BGR15, RGB15, RGB8P, GRAY16_LE, GRAY16_BE, GRAY10_LE32, GRAY8 }\n          width: [ 1, 2147483647 ]\n         height: [ 1, 2147483647 ]\n      framerate: [ 0/1, 2147483647/1 ]\n",
+                        "caps": "video/x-raw:\n         format: { A444_16LE, A444_16BE, Y416_LE, AYUV64, RGBA64_LE, ARGB64, ARGB64_LE, BGRA64_LE, ABGR64_LE, Y416_BE, RGBA64_BE, ARGB64_BE, BGRA64_BE, ABGR64_BE, A422_16LE, A422_16BE, A420_16LE, A420_16BE, A444_12LE, GBRA_12LE, A444_12BE, GBRA_12BE, Y412_LE, Y412_BE, A422_12LE, A422_12BE, A420_12LE, A420_12BE, A444_10LE, GBRA_10LE, A444_10BE, GBRA_10BE, A422_10LE, A422_10BE, A420_10LE, A420_10BE, BGR10A2_LE, RGB10A2_LE, Y410, A444, GBRA, AYUV, VUYA, RGBA, RBGA, ARGB, BGRA, ABGR, A422, A420, AV12, Y444_16LE, GBR_16LE, Y444_16BE, GBR_16BE, Y216_LE, Y216_BE, v216, P016_LE, P016_BE, Y444_12LE, GBR_12LE, Y444_12BE, GBR_12BE, I422_12LE, I422_12BE, Y212_LE, Y212_BE, I420_12LE, I420_12BE, P012_LE, P012_BE, Y444_10LE, GBR_10LE, Y444_10BE, GBR_10BE, r210, I422_10LE, I422_10BE, NV16_10LE32, Y210, UYVP, v210, I420_10LE, I420_10BE, P010_10LE, NV12_10LE40, NV12_10LE32, P010_10BE, MT2110R, MT2110T, NV12_10BE_8L128, NV12_10LE40_4L4, Y444, BGRP, GBR, RGBP, NV24, v308, IYU2, RGBx, xRGB, BGRx, xBGR, RGB, BGR, Y42B, NV16, NV61, YUY2, YVYU, UYVY, VYUY, I420, YV12, NV12, NV21, NV12_16L32S, NV12_32L32, NV12_4L4, NV12_64Z32, NV12_8L128, Y41B, IYU1, YUV9, YVU9, BGR16, RGB16, BGR15, RGB15, RGB8P, GRAY16_LE, GRAY16_BE, GRAY10_LE16, GRAY10_LE32, GRAY8 }\n          width: [ 1, 2147483647 ]\n         height: [ 1, 2147483647 ]\n      framerate: [ 0/1, 2147483647/1 ]\n",
                         "direction": "src",
                         "presence": "always"
                     }
@@ -9022,6 +10505,114 @@
                         "mutable": "null",
                         "readable": true,
                         "type": "GstRtpAc3PayAggregateMode",
+                        "writable": true
+                    },
+                    "max-ptime": {
+                        "blurb": "Maximum duration of the packet data in ns (-1 = unlimited up to MTU)",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "18446744073709551615",
+                        "max": "9223372036854775807",
+                        "min": "-1",
+                        "mutable": "playing",
+                        "readable": true,
+                        "type": "gint64",
+                        "writable": true
+                    }
+                },
+                "rank": "marginal"
+            },
+            "rtpamrdepay2": {
+                "author": "Sebastian Dröge <sebastian@centricular.com>",
+                "description": "Depayload an AMR audio stream from RTP packets (RFC 3267)",
+                "hierarchy": [
+                    "GstRtpAmrDepay2",
+                    "GstRtpBaseDepay2",
+                    "GstElement",
+                    "GstObject",
+                    "GInitiallyUnowned",
+                    "GObject"
+                ],
+                "klass": "Codec/Depayloader/Network/RTP",
+                "pad-templates": {
+                    "sink": {
+                        "caps": "application/x-rtp:\n          media: audio\n  encoding-name: AMR\n     clock-rate: 8000\napplication/x-rtp:\n          media: audio\n  encoding-name: AMR-WB\n     clock-rate: 16000\n",
+                        "direction": "sink",
+                        "presence": "always"
+                    },
+                    "src": {
+                        "caps": "audio/AMR:\n       channels: 1\n           rate: 8000\naudio/AMR-WB:\n       channels: 1\n           rate: 16000\n",
+                        "direction": "src",
+                        "presence": "always"
+                    }
+                },
+                "rank": "marginal"
+            },
+            "rtpamrpay2": {
+                "author": "Sebastian Dröge <sebastian@centricular.com>",
+                "description": "Payload an AMR audio stream into RTP packets (RFC 3267)",
+                "hierarchy": [
+                    "GstRtpAmrPay2",
+                    "GstRtpBasePay2",
+                    "GstElement",
+                    "GstObject",
+                    "GInitiallyUnowned",
+                    "GObject"
+                ],
+                "klass": "Codec/Payloader/Network/RTP",
+                "pad-templates": {
+                    "sink": {
+                        "caps": "audio/AMR:\n       channels: 1\n           rate: 8000\naudio/AMR-WB:\n       channels: 1\n           rate: 16000\n",
+                        "direction": "sink",
+                        "presence": "always"
+                    },
+                    "src": {
+                        "caps": "application/x-rtp:\n          media: audio\n  encoding-name: AMR\n     clock-rate: 8000\nencoding-params: 1\n    octet-align: { (string)0, (string)1 }\n            crc: 0\n robust-sorting: 0\n   interleaving: 0\napplication/x-rtp:\n          media: audio\n  encoding-name: AMR-WB\n     clock-rate: 16000\nencoding-params: 1\n    octet-align: { (string)0, (string)1 }\n            crc: 0\n robust-sorting: 0\n   interleaving: 0\n",
+                        "direction": "src",
+                        "presence": "always"
+                    }
+                },
+                "properties": {
+                    "aggregate-mode": {
+                        "blurb": "Whether to send out audio frames immediately or aggregate them until a packet is full.",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "auto (-1)",
+                        "mutable": "null",
+                        "readable": true,
+                        "type": "GstRtpAmrPayAggregateMode",
+                        "writable": true
+                    },
+                    "alignment-threshold": {
+                        "blurb": "Timestamp alignment threshold in nanoseconds",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "40000000",
+                        "max": "18446744073709551615",
+                        "min": "0",
+                        "mutable": "playing",
+                        "readable": true,
+                        "type": "guint64",
+                        "writable": true
+                    },
+                    "discont-wait": {
+                        "blurb": "Window of time in nanoseconds to wait before creating a discontinuity",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "1000000000",
+                        "max": "18446744073709551615",
+                        "min": "0",
+                        "mutable": "playing",
+                        "readable": true,
+                        "type": "guint64",
                         "writable": true
                     },
                     "max-ptime": {
@@ -10202,6 +11793,26 @@
                     }
                 ]
             },
+            "GstRtpAmrPayAggregateMode": {
+                "kind": "enum",
+                "values": [
+                    {
+                        "desc": "Automatic: zero-latency if upstream is live, otherwise aggregate frames until packet is full.",
+                        "name": "auto",
+                        "value": "-1"
+                    },
+                    {
+                        "desc": "Zero Latency: always send out frames right away, do not wait for more frames to fill a packet.",
+                        "name": "zero-latency",
+                        "value": "0"
+                    },
+                    {
+                        "desc": "Aggregate: collect audio frames until we have a full packet or the max-ptime limit is hit (if set).",
+                        "name": "aggregate",
+                        "value": "1"
+                    }
+                ]
+            },
             "GstRtpBaseAudioPay2": {
                 "hierarchy": [
                     "GstRtpBaseAudioPay2",
@@ -10878,11 +12489,269 @@
         "package": "gst-plugin-tracers",
         "source": "gst-plugin-tracers",
         "tracers": {
-            "buffer-lateness": {},
-            "pad-push-timings": {},
-            "pcap-writer": {},
-            "pipeline-snapshot": {},
-            "queue-levels": {}
+            "buffer-lateness": {
+                "hierarchy": [
+                    "GstBufferLateness",
+                    "GstTracer",
+                    "GstObject",
+                    "GInitiallyUnowned",
+                    "GObject"
+                ],
+                "signals": {
+                    "write-log": {
+                        "action": true,
+                        "args": [
+                            {
+                                "name": "arg0",
+                                "type": "gchararray"
+                            }
+                        ],
+                        "return-type": "void",
+                        "when": "last"
+                    }
+                }
+            },
+            "memory-tracer": {
+                "hierarchy": [
+                    "GstMemoryTracer",
+                    "GstTracer",
+                    "GstObject",
+                    "GInitiallyUnowned",
+                    "GObject"
+                ],
+                "properties": {
+                    "file": {
+                        "blurb": "Path to the file to write memory usage information",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "NULL",
+                        "mutable": "null",
+                        "readable": false,
+                        "type": "gchararray",
+                        "writable": true
+                    }
+                },
+                "signals": {
+                    "write-log": {
+                        "action": true,
+                        "args": [
+                            {
+                                "name": "arg0",
+                                "type": "gchararray"
+                            }
+                        ],
+                        "return-type": "void",
+                        "when": "last"
+                    }
+                }
+            },
+            "pad-push-timings": {
+                "hierarchy": [
+                    "GstPadPushTimings",
+                    "GstTracer",
+                    "GstObject",
+                    "GInitiallyUnowned",
+                    "GObject"
+                ]
+            },
+            "pcap-writer": {
+                "hierarchy": [
+                    "GstPcapWriter",
+                    "GstTracer",
+                    "GstObject",
+                    "GInitiallyUnowned",
+                    "GObject"
+                ],
+                "properties": {
+                    "fake-protocol": {
+                        "blurb": "Protocol to fake in pcap files",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "udp (0)",
+                        "mutable": "null",
+                        "readable": true,
+                        "type": "GstPcapWriterFakeProtocol",
+                        "writable": true
+                    },
+                    "output-dir": {
+                        "blurb": "Directory where to save pcap files",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "tracer_pcaps",
+                        "mutable": "null",
+                        "readable": true,
+                        "type": "gchararray",
+                        "writable": true
+                    },
+                    "pad-path": {
+                        "blurb": "Pad path to target",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "NULL",
+                        "mutable": "null",
+                        "readable": true,
+                        "type": "gchararray",
+                        "writable": true
+                    },
+                    "target-factory": {
+                        "blurb": "Factory name to target",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "NULL",
+                        "mutable": "null",
+                        "readable": true,
+                        "type": "gchararray",
+                        "writable": true
+                    }
+                }
+            },
+            "pipeline-snapshot": {
+                "hierarchy": [
+                    "GstPipelineSnapshot",
+                    "GstTracer",
+                    "GstObject",
+                    "GInitiallyUnowned",
+                    "GObject"
+                ],
+                "properties": {
+                    "cleanup-mode": {
+                        "blurb": "Cleanup mode",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "none (2)",
+                        "mutable": "null",
+                        "readable": true,
+                        "type": "GstPipelineSnapshotCleanupMode",
+                        "writable": true
+                    },
+                    "dot-dir": {
+                        "blurb": "Directory where to place dot files",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": true,
+                        "controllable": false,
+                        "default": "NULL",
+                        "mutable": "null",
+                        "readable": true,
+                        "type": "gchararray",
+                        "writable": true
+                    },
+                    "dot-pipeline-ptr": {
+                        "blurb": "Add pipeline ptr value to dot files",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "false",
+                        "mutable": "null",
+                        "readable": true,
+                        "type": "gboolean",
+                        "writable": true
+                    },
+                    "dot-prefix": {
+                        "blurb": "Prefix for dot files",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "pipeline-snapshot-",
+                        "mutable": "null",
+                        "readable": true,
+                        "type": "gchararray",
+                        "writable": true
+                    },
+                    "dot-ts": {
+                        "blurb": "Add timestamp to dot files",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "true",
+                        "mutable": "null",
+                        "readable": true,
+                        "type": "gboolean",
+                        "writable": true
+                    },
+                    "dots-viewer-ws-url": {
+                        "blurb": "gst-dots-viewer websocket URL",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": true,
+                        "controllable": false,
+                        "default": "NULL",
+                        "mutable": "null",
+                        "readable": true,
+                        "type": "gchararray",
+                        "writable": true
+                    },
+                    "folder-mode": {
+                        "blurb": "How to create folder each time a snapshot of all pipelines is made",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "none (0)",
+                        "mutable": "null",
+                        "readable": true,
+                        "type": "GstPipelineSnapshotFolderMode",
+                        "writable": true
+                    },
+                    "xdg-cache": {
+                        "blurb": "Use $XDG_CACHE_DIR/gstreamer-dots",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": true,
+                        "controllable": false,
+                        "default": "false",
+                        "mutable": "null",
+                        "readable": true,
+                        "type": "gboolean",
+                        "writable": true
+                    }
+                },
+                "signals": {
+                    "snapshot": {
+                        "action": true,
+                        "args": [],
+                        "return-type": "void",
+                        "when": "last"
+                    }
+                }
+            },
+            "queue-levels": {
+                "hierarchy": [
+                    "GstQueueLevels",
+                    "GstTracer",
+                    "GstObject",
+                    "GInitiallyUnowned",
+                    "GObject"
+                ],
+                "signals": {
+                    "write-log": {
+                        "action": true,
+                        "args": [
+                            {
+                                "name": "arg0",
+                                "type": "gchararray"
+                            }
+                        ],
+                        "return-type": "void",
+                        "when": "last"
+                    }
+                }
+            }
         },
         "url": "https://gitlab.freedesktop.org/gstreamer/gst-plugins-rs"
     },
@@ -11436,6 +13305,20 @@
                         "direction": "src",
                         "presence": "sometimes",
                         "type": "GstWebRTCSrcPad"
+                    }
+                },
+                "properties": {
+                    "connect-to-first-producer": {
+                        "blurb": "When enabled, automatically connect to the first peer that becomes available if no 'peer-id' is specified.",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "false",
+                        "mutable": "ready",
+                        "readable": true,
+                        "type": "gboolean",
+                        "writable": true
                     }
                 },
                 "rank": "primary"
@@ -12694,6 +14577,16 @@
                         "direction": "src",
                         "presence": "request",
                         "type": "GstSpeechmaticsTranscriberSrcPad"
+                    },
+                    "unsynced_src": {
+                        "caps": "application/x-json:\n",
+                        "direction": "src",
+                        "presence": "always"
+                    },
+                    "unsynced_translate_src_%%u": {
+                        "caps": "application/x-json:\n",
+                        "direction": "src",
+                        "presence": "sometimes"
                     }
                 },
                 "properties": {
@@ -12718,6 +14611,42 @@
                         "mutable": "ready",
                         "readable": true,
                         "type": "gchararray",
+                        "writable": true
+                    },
+                    "diarization": {
+                        "blurb": "Defines how to separate speakers in the audio",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "none (0)",
+                        "mutable": "ready",
+                        "readable": true,
+                        "type": "GstSpeechmaticsTranscriberDiarization",
+                        "writable": true
+                    },
+                    "enable-late-punctuation-hack": {
+                        "blurb": "Pass a reduced max-delay to speechmatics to make sure we always get punctuation in time for joining it with the preceding word.",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "true",
+                        "mutable": "ready",
+                        "readable": true,
+                        "type": "gboolean",
+                        "writable": true
+                    },
+                    "join-punctuation": {
+                        "blurb": "Whether punctuation should be joined with the preceding word",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "true",
+                        "mutable": "playing",
+                        "readable": true,
+                        "type": "gboolean",
                         "writable": true
                     },
                     "language-code": {
@@ -12760,6 +14689,34 @@
                         "type": "guint",
                         "writable": true
                     },
+                    "max-delay": {
+                        "blurb": "Max delay to pass to the speechmatics API (0 = use latency)",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "0",
+                        "max": "-1",
+                        "min": "0",
+                        "mutable": "null",
+                        "readable": true,
+                        "type": "guint",
+                        "writable": true
+                    },
+                    "max-speakers": {
+                        "blurb": "The maximum number of speakers that may be detected with diarization=speaker",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "50",
+                        "max": "-1",
+                        "min": "0",
+                        "mutable": "null",
+                        "readable": true,
+                        "type": "guint",
+                        "writable": true
+                    },
                     "url": {
                         "blurb": "URL of the transcription server",
                         "conditionally-available": false,
@@ -12779,6 +14736,21 @@
         "filename": "gstspeechmatics",
         "license": "Proprietary",
         "other-types": {
+            "GstSpeechmaticsTranscriberDiarization": {
+                "kind": "enum",
+                "values": [
+                    {
+                        "desc": "None: no diarization",
+                        "name": "none",
+                        "value": "0"
+                    },
+                    {
+                        "desc": "Speaker: identify speakers by their voices",
+                        "name": "speaker",
+                        "value": "1"
+                    }
+                ]
+            },
             "GstSpeechmaticsTranscriberSrcPad": {
                 "hierarchy": [
                     "GstSpeechmaticsTranscriberSrcPad",
@@ -14701,6 +16673,30 @@
                     }
                 },
                 "properties": {
+                    "cache": {
+                        "blurb": "Cache playlist items from the network to disk so they are downloaded only once when playing multiple iterations.",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "false",
+                        "mutable": "ready",
+                        "readable": true,
+                        "type": "gboolean",
+                        "writable": true
+                    },
+                    "cache-dir": {
+                        "blurb": "The directory where playlist items are downloaded to, if 'cache' is enabled. If not set (default), the XDG cache directory is used.",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "NULL",
+                        "mutable": "ready",
+                        "readable": true,
+                        "type": "gchararray",
+                        "writable": true
+                    },
                     "current-iteration": {
                         "blurb": "The index of the current playlist iteration, or 0 if the iterations property is 0 (unlimited playlist)",
                         "conditionally-available": false,
@@ -14763,6 +16759,74 @@
         "other-types": {},
         "package": "gst-plugin-uriplaylistbin",
         "source": "gst-plugin-uriplaylistbin",
+        "tracers": {},
+        "url": "https://gitlab.freedesktop.org/gstreamer/gst-plugins-rs"
+    },
+    "vvdec": {
+        "description": "GStreamer VVdeC VVC/H.266 decoder plugin",
+        "elements": {
+            "vvdec": {
+                "author": "Carlos Bentzen <cadubentzen@igalia.com>",
+                "description": "Decode VVC/H.266 video streams with VVdeC",
+                "hierarchy": [
+                    "GstVVdeC",
+                    "GstVideoDecoder",
+                    "GstElement",
+                    "GstObject",
+                    "GInitiallyUnowned",
+                    "GObject"
+                ],
+                "klass": "Codec/Decoder/Video",
+                "pad-templates": {
+                    "sink": {
+                        "caps": "video/x-h266:\n  stream-format: byte-stream\n      alignment: au\n",
+                        "direction": "sink",
+                        "presence": "always"
+                    },
+                    "src": {
+                        "caps": "video/x-raw:\n         format: { GRAY8, I420, Y42B, Y444, GRAY10_LE16, I420_10LE, I422_10LE, Y444_10LE }\n          width: [ 1, 2147483647 ]\n         height: [ 1, 2147483647 ]\n      framerate: [ 0/1, 2147483647/1 ]\n",
+                        "direction": "src",
+                        "presence": "always"
+                    }
+                },
+                "properties": {
+                    "n-parser-threads": {
+                        "blurb": "Number of parser threads to use while decoding (set to -1 to let libvvdec choose the number of parser threads, set to 0 to parse on the element streaming thread)",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "-1",
+                        "max": "2147483647",
+                        "min": "-1",
+                        "mutable": "null",
+                        "readable": true,
+                        "type": "gint",
+                        "writable": true
+                    },
+                    "n-threads": {
+                        "blurb": "Number of threads to use while decoding (set to -1 to use the number of logical cores, set to 0 to decode in a single thread)",
+                        "conditionally-available": false,
+                        "construct": false,
+                        "construct-only": false,
+                        "controllable": false,
+                        "default": "-1",
+                        "max": "2147483647",
+                        "min": "-1",
+                        "mutable": "null",
+                        "readable": true,
+                        "type": "gint",
+                        "writable": true
+                    }
+                },
+                "rank": "secondary"
+            }
+        },
+        "filename": "gstvvdec",
+        "license": "MPL-2.0",
+        "other-types": {},
+        "package": "gst-plugin-vvdec",
+        "source": "gst-plugin-vvdec",
         "tracers": {},
         "url": "https://gitlab.freedesktop.org/gstreamer/gst-plugins-rs"
     },

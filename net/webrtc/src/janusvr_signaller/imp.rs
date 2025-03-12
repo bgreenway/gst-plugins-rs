@@ -34,8 +34,8 @@ static CAT: LazyLock<gst::DebugCategory> = LazyLock::new(|| {
 });
 
 fn transaction_id() -> String {
-    thread_rng()
-        .sample_iter(&rand::distributions::Alphanumeric)
+    rand::rng()
+        .sample_iter(&rand::distr::Alphanumeric)
         .map(char::from)
         .take(30)
         .collect()
@@ -186,6 +186,17 @@ struct InnerHangup {
 }
 
 #[derive(Serialize, Deserialize, Debug)]
+struct InnerSlowLink {
+    session_id: u64,
+    sender: u64,
+    opaque_id: Option<String>,
+    mid: String,
+    media: String,
+    uplink: bool,
+    lost: u64,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
 struct RoomJoined {
     room: JanusId,
     id: JanusId,
@@ -212,6 +223,12 @@ struct RoomTalking {
 }
 
 #[derive(Serialize, Deserialize, Debug)]
+struct SlowLink {
+    #[serde(rename = "current-bitrate")]
+    current_bitrate: u32,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
 #[serde(tag = "videoroom", rename_all = "kebab-case")]
 enum VideoRoomData {
     Joined(RoomJoined),
@@ -219,6 +236,8 @@ enum VideoRoomData {
     Destroyed(RoomDestroyed),
     Talking(RoomTalking),
     StoppedTalking(RoomTalking),
+    #[serde(rename = "slow_link")]
+    SlowLink(SlowLink),
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -259,6 +278,7 @@ enum JsonReply {
     Media,
     Error(InnerError),
     HangUp(InnerHangup),
+    SlowLink(InnerSlowLink),
 }
 
 #[derive(Default)]
@@ -349,7 +369,7 @@ impl Signaller {
                             Some(msg) => {
                                 gst::log!(CAT, "Sending websocket message {:?}", msg);
                                 res = ws_sink
-                                    .send(WsMessage::Text(serde_json::to_string(&msg).unwrap()))
+                                    .send(WsMessage::text(serde_json::to_string(&msg).unwrap()))
                                     .await;
                             },
                             None => break,
@@ -371,7 +391,7 @@ impl Signaller {
                                     apisecret,
                                 });
                                 res = ws_sink
-                                    .send(WsMessage::Text(serde_json::to_string(&msg).unwrap()))
+                                    .send(WsMessage::text(serde_json::to_string(&msg).unwrap()))
                                     .await;
                         }
                     }
@@ -542,6 +562,9 @@ impl Signaller {
                         VideoRoomData::StoppedTalking(talking) => {
                             self.emit_talking(false, talking.id, talking.audio_level);
                         }
+                        VideoRoomData::SlowLink(_slow_link) => {
+                            // TODO: use to reduce the bitrate?
+                        }
                     }
                 }
             }
@@ -550,7 +573,7 @@ impl Signaller {
             }
             JsonReply::HangUp(hangup) => self.raise_error(format!("hangup: {}", hangup.reason)),
             // ignore for now
-            JsonReply::Ack | JsonReply::Media => {}
+            JsonReply::Ack | JsonReply::Media | JsonReply::SlowLink(_) => {}
         }
     }
 

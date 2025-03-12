@@ -35,7 +35,7 @@ use std::sync::{Arc, Mutex};
 use std::sync::LazyLock;
 
 use super::transcribe::{TranscriberSettings, TranscriberStream, TranscriptEvent, TranscriptItem};
-use super::translate::{TranslateLoop, TranslatedItem};
+use super::translate::{TranslateLoop, TranslatedItem, Translation};
 use super::{
     AwsTranscriberResultStability, AwsTranscriberVocabularyFilterMethod,
     TranslationTokenizationMethod, CAT,
@@ -74,6 +74,7 @@ pub const GRANULARITY: gst::ClockTime = gst::ClockTime::from_mseconds(100);
 
 const OUTPUT_LANG_CODE_PROPERTY: &str = "language-code";
 const DEFAULT_OUTPUT_LANG_CODE: Option<&str> = None;
+const DEFAULT_POST_LATE_WARNINGS: bool = false;
 
 const TRANSLATION_TOKENIZATION_PROPERTY: &str = "tokenization-method";
 
@@ -92,6 +93,7 @@ pub(super) struct Settings {
     session_token: Option<String>,
     pub vocabulary_filter: Option<String>,
     pub vocabulary_filter_method: AwsTranscriberVocabularyFilterMethod,
+    post_late_warnings: bool,
 }
 
 impl Default for Settings {
@@ -110,6 +112,7 @@ impl Default for Settings {
             session_token: None,
             vocabulary_filter: None,
             vocabulary_filter_method: DEFAULT_VOCABULARY_FILTER_METHOD,
+            post_late_warnings: DEFAULT_POST_LATE_WARNINGS,
         }
     }
 }
@@ -276,7 +279,16 @@ impl Transcriber {
                 gst::info!(CAT, "Received caps {c:?}");
                 true
             }
-            StreamStart(_) => true,
+            StreamStart(_) => {
+                let state = self.state.lock().unwrap();
+                match self.start_srcpad_tasks(&state) {
+                    Err(err) => {
+                        gst::error!(CAT, imp = self, "Failed to start srcpad tasks: {err}");
+                        false
+                    }
+                    Ok(_) => true,
+                }
+            }
             _ => gst::Pad::event_default(pad, Some(&*self.obj()), event),
         }
     }
@@ -462,9 +474,16 @@ impl Transcriber {
                 use TranscriptEvent::*;
                 match res {
                     None => (),
-                    Some(Items(items)) => {
+                    Some(Transcript {
+                        items,
+                        serialized
+                    }) => {
                         if imp.transcript_event_tx.receiver_count() > 0 {
-                            let _ = imp.transcript_event_tx.send(Items(items.clone()));
+                            let _ = imp.transcript_event_tx.send(
+                                Transcript {
+                                    items: items.clone(),
+                                    serialized: serialized.clone()
+                                });
                         }
 
                         if imp.transcript_event_for_translate_tx.receiver_count() > 0 {
@@ -472,7 +491,10 @@ impl Transcriber {
                                 if let Some(items_to_translate) = translate_queue.push(item) {
                                     let _ = imp
                                         .transcript_event_for_translate_tx
-                                        .send(Items(items_to_translate.into()));
+                                        .send(Transcript {
+                                            items: items_to_translate.into(),
+                                            serialized: None,
+                                        });
                                 }
                             }
                         }
@@ -489,7 +511,10 @@ impl Transcriber {
                                 translate_queue.drain().collect();
                             let _ = imp
                                 .transcript_event_for_translate_tx
-                                .send(Items(items_to_translate.into()));
+                                .send(Transcript {
+                                    items: items_to_translate.into(),
+                                    serialized: None,
+                                });
 
                             let _ = imp.transcript_event_for_translate_tx.send(Eos);
                         }
@@ -518,7 +543,10 @@ impl Transcriber {
                             );
                             let _ = imp
                                 .transcript_event_for_translate_tx
-                                .send(Items(items_to_translate.into()));
+                                .send(Transcript {
+                                    items: items_to_translate.into(),
+                                    serialized: None,
+                                });
                         }
                     }
                 }
@@ -662,11 +690,19 @@ impl ObjectSubclass for Transcriber {
             .flags(gst::PadFlags::FIXED_CAPS)
             .build();
 
+        let templ = klass.pad_template("unsynced_src").unwrap();
+        let static_unsynced_srcpad = gst::PadBuilder::<gst::Pad>::from_template(&templ)
+            .flags(gst::PadFlags::FIXED_CAPS)
+            .build();
         // Setting the channel capacity so that a TranslateSrcPad that would lag
         // behind for some reasons get a chance to catch-up without loosing items.
         // Receiver will be created by subscribing to sender later.
         let (transcript_event_for_translate_tx, _) = broadcast::channel(128);
         let (transcript_event_tx, _) = broadcast::channel(128);
+
+        static_srcpad
+            .imp()
+            .set_unsynced_pad(&static_unsynced_srcpad);
 
         Self {
             static_srcpad,
@@ -678,6 +714,18 @@ impl ObjectSubclass for Transcriber {
             transcript_event_tx,
         }
     }
+}
+
+fn store_language_tag(pad: &gst::Pad, stream_id: &str, language_code: &str) {
+    // Make sure our tags do not get overwritten
+    let sev = gst::event::StreamStart::builder(stream_id).build();
+    let _ = pad.store_sticky_event(&sev);
+
+    let mut tl = gst::TagList::new();
+    tl.make_mut()
+        .add::<gst::tags::LanguageCode>(&language_code, gst::TagMergeMode::Append);
+    let ev = gst::event::Tag::builder(tl).build();
+    let _ = pad.store_sticky_event(&ev);
 }
 
 impl ObjectImpl for Transcriber {
@@ -782,17 +830,64 @@ impl ObjectImpl for Transcriber {
     fn constructed(&self) {
         self.parent_constructed();
 
+        let language_code = self.settings.lock().unwrap().language_code.clone();
+
         let obj = self.obj();
         obj.add_pad(&self.sinkpad).unwrap();
         obj.add_pad(&self.static_srcpad).unwrap();
+        self.static_srcpad.set_active(true).unwrap();
+
+        store_language_tag(
+            self.static_srcpad.upcast_ref(),
+            "transcription",
+            &language_code,
+        );
+
+        let pad_state = self.static_srcpad.imp().state.lock().unwrap();
+
+        let unsynced_pad = pad_state.unsynced_pad.as_ref().unwrap();
+
+        obj.add_pad(unsynced_pad).unwrap();
+        unsynced_pad.set_active(true).unwrap();
+
+        store_language_tag(
+            unsynced_pad.upcast_ref(),
+            "unsynced-transcription",
+            &language_code,
+        );
+
         obj.set_element_flags(gst::ElementFlags::PROVIDE_CLOCK | gst::ElementFlags::REQUIRE_CLOCK);
     }
 
     fn set_property(&self, _id: usize, value: &glib::Value, pspec: &glib::ParamSpec) {
         match pspec.name() {
             "language-code" => {
+                let language_code: String = value.get().expect("type checked upstream");
+
+                store_language_tag(
+                    self.static_srcpad.upcast_ref(),
+                    "transcription",
+                    &language_code,
+                );
+
+                if let Some(unsynced_pad) = self
+                    .static_srcpad
+                    .imp()
+                    .state
+                    .lock()
+                    .unwrap()
+                    .unsynced_pad
+                    .as_ref()
+                {
+                    store_language_tag(
+                        unsynced_pad.upcast_ref(),
+                        "unsynced-transcription",
+                        &language_code,
+                    );
+                }
+
                 let mut settings = self.settings.lock().unwrap();
-                settings.language_code = value.get().expect("type checked upstream");
+                settings.language_code = language_code;
             }
             DEPRECATED_LATENCY_PROPERTY => {
                 let mut settings = self.settings.lock().unwrap();
@@ -958,6 +1053,21 @@ impl ElementImpl for Transcriber {
                 super::TranslateSrcPad::static_type(),
             )
             .unwrap();
+            let src_caps = gst::Caps::builder("application/x-json").build();
+            let unsynced_src_pad_template = gst::PadTemplate::new(
+                "unsynced_src",
+                gst::PadDirection::Src,
+                gst::PadPresence::Always,
+                &src_caps,
+            )
+            .unwrap();
+            let unsynced_sometimes_src_pad_template = gst::PadTemplate::new(
+                "unsynced_translate_src_%u",
+                gst::PadDirection::Src,
+                gst::PadPresence::Sometimes,
+                &src_caps,
+            )
+            .unwrap();
 
             let sink_caps = gst_audio::AudioCapsBuilder::new()
                 .format(gst_audio::AudioFormat::S16le)
@@ -972,7 +1082,13 @@ impl ElementImpl for Transcriber {
             )
             .unwrap();
 
-            vec![src_pad_template, req_src_pad_template, sink_pad_template]
+            vec![
+                src_pad_template,
+                req_src_pad_template,
+                unsynced_src_pad_template,
+                unsynced_sometimes_src_pad_template,
+                sink_pad_template,
+            ]
         });
 
         PAD_TEMPLATES.as_ref()
@@ -1041,12 +1157,28 @@ impl ElementImpl for Transcriber {
             .flags(gst::PadFlags::FIXED_CAPS)
             .build();
 
+        let templ = self
+            .obj()
+            .class()
+            .pad_template("unsynced_translate_src_%u")
+            .unwrap();
+        let static_unsynced_srcpad = gst::PadBuilder::<gst::Pad>::from_template(&templ)
+            .name(format!("unsynced_translate_src_{}", state.pad_serial).as_str())
+            .flags(gst::PadFlags::FIXED_CAPS)
+            .build();
+
+        pad.imp().set_unsynced_pad(&static_unsynced_srcpad);
+
         state.srcpads.insert(pad.clone());
 
         state.pad_serial += 1;
         drop(state);
 
         self.obj().add_pad(&pad).unwrap();
+        self.obj().add_pad(&static_unsynced_srcpad).unwrap();
+
+        pad.set_active(true).unwrap();
+        static_unsynced_srcpad.set_active(true).unwrap();
 
         let _ = self
             .obj()
@@ -1059,6 +1191,14 @@ impl ElementImpl for Transcriber {
     fn release_pad(&self, pad: &gst::Pad) {
         pad.set_active(false).unwrap();
         self.obj().remove_pad(pad).unwrap();
+        self.state.lock().unwrap().srcpads.remove(pad);
+
+        let translate_srcpad = pad.downcast_ref::<super::TranslateSrcPad>().unwrap();
+
+        if let Some(unsynced_pad) = translate_srcpad.imp().take_unsynced_pad() {
+            unsynced_pad.set_active(false).unwrap();
+            self.obj().remove_pad(&unsynced_pad).unwrap();
+        }
 
         self.obj().child_removed(pad, &pad.name());
         let _ = self
@@ -1098,6 +1238,7 @@ impl ChildProxyImpl for Transcriber {
             .map(|p| p.upcast())
     }
 }
+
 struct TranslationPadTask {
     pad: glib::subclass::ObjectImplRef<TranslateSrcPad>,
     elem: super::Transcriber,
@@ -1105,13 +1246,15 @@ struct TranslationPadTask {
     needs_translate: bool,
     translate_loop_handle: Option<task::JoinHandle<Result<(), gst::ErrorMessage>>>,
     to_translate_tx: Option<mpsc::Sender<Arc<Vec<TranscriptItem>>>>,
-    from_translate_rx: Option<mpsc::Receiver<Vec<TranslatedItem>>>,
+    from_translate_rx: Option<mpsc::Receiver<Translation>>,
     send_events: bool,
     output_items: VecDeque<OutputItem>,
     our_latency: gst::ClockTime,
     seqnum: gst::Seqnum,
     send_eos: bool,
     pending_translations: usize,
+    unsynced_pad: Option<gst::Pad>,
+    unsynced: Option<String>,
 }
 
 impl TranslationPadTask {
@@ -1189,6 +1332,8 @@ impl TranslationPadTask {
             seqnum: gst::Seqnum::next(),
             send_eos: false,
             pending_translations: 0,
+            unsynced_pad: pad.state.lock().unwrap().unsynced_pad.clone(),
+            unsynced: None,
         })
     }
 }
@@ -1234,8 +1379,12 @@ impl TranslationPadTask {
                 use TranscriptEvent::*;
                 use broadcast::error::RecvError;
                 match items_res {
-                    Ok(Items(transcript_items)) => {
-                        self.output_items.extend(transcript_items.iter().map(Into::into));
+                    Ok(Transcript {
+                        items,
+                        serialized,
+                    }) => {
+                        self.unsynced = serialized;
+                        self.output_items.extend(items.iter().map(Into::into));
                     }
                     Ok(Eos) => {
                         gst::debug!(CAT, imp = self.pad, "Got eos");
@@ -1282,7 +1431,10 @@ impl TranslationPadTask {
                     use TranscriptEvent::*;
                     use broadcast::error::RecvError;
                     match items_res {
-                        Ok(Items(items_to_translate)) => Some(items_to_translate),
+                        Ok(Transcript {
+                            items,
+                            ..
+                        }) => Some(items),
                         Ok(Eos) => {
                             gst::debug!(CAT, imp = self.pad, "Got eos");
                             self.send_eos = true;
@@ -1328,15 +1480,24 @@ impl TranslationPadTask {
             .as_mut()
             .expect("from_translation chan must be available in translation mode");
 
-        while let Ok(translated_items) = from_translate_rx.try_next() {
-            let Some(translated_items) = translated_items else {
+        while let Ok(translation) = from_translate_rx.try_next() {
+            let Some(translation) = translation else {
                 const ERR: &str = "translation chan terminated";
                 gst::debug!(CAT, imp = self.pad, "{ERR}");
                 return Err(gst::error_msg!(gst::StreamError::Failed, ["{ERR}"]));
             };
 
+            if let Some(pts) = translation.items.first().map(|i| i.pts) {
+                self.unsynced = Some(
+                    serde_json::json!({
+                        "translation": translation.translation,
+                        "start_time": *pts,
+                    })
+                    .to_string(),
+                );
+            }
             self.output_items
-                .extend(translated_items.into_iter().map(Into::into));
+                .extend(translation.items.into_iter().map(Into::into));
             self.pending_translations = self.pending_translations.saturating_sub(1);
         }
 
@@ -1362,6 +1523,35 @@ impl TranslationPadTask {
             (last_position, state.discont_pending)
         };
 
+        if let Some(unsynced) = self.unsynced.take() {
+            if let Some(ref unsynced_pad) = self.unsynced_pad {
+                if unsynced_pad.last_flow_result().is_ok() {
+                    gst::log!(
+                        CAT,
+                        obj = unsynced_pad,
+                        "pushing serialized transcript with timestamp {now}"
+                    );
+                    gst::trace!(CAT, obj = unsynced_pad, "serialized transcript: {unsynced}");
+
+                    let mut buf = gst::Buffer::from_mut_slice(unsynced.into_bytes());
+                    {
+                        let buf_mut = buf.get_mut().unwrap();
+
+                        buf_mut.set_pts(now);
+                    }
+
+                    let _ = unsynced_pad.push(buf);
+                } else {
+                    gst::log!(
+                        CAT,
+                        obj = unsynced_pad,
+                        "not pushing serialized transcript, last flow result: {:?}",
+                        unsynced_pad.last_flow_result()
+                    );
+                }
+            }
+        }
+
         /* First, check our pending buffers */
         while let Some(item) = self.output_items.front() {
             // Note: items pts start from 0 + lateness
@@ -1381,7 +1571,7 @@ impl TranslationPadTask {
                 /* Safe unwrap, we know we have an item */
                 let OutputItem {
                     pts: item_pts,
-                    mut duration,
+                    duration,
                     content,
                 } = self.output_items.pop_front().unwrap();
 
@@ -1422,7 +1612,6 @@ impl TranslationPadTask {
                         // The buffer we are about to push was expected to start
                         // before the end of last item previously pushed to the stream.
                         // => update it to fit in stream.
-                        let delta = last_position - pts;
 
                         gst::warning!(
                             CAT,
@@ -1430,21 +1619,30 @@ impl TranslationPadTask {
                             "Updating item PTS ({pts} < {last_position}), consider increasing latency",
                         );
 
-                        let details = gst::Structure::builder("awstranscriber/late-item")
-                            .field("original-pts", pts)
-                            .field("last-position", last_position)
-                            .build();
+                        let post_late_warnings = self
+                            .pad
+                            .parent()
+                            .imp()
+                            .settings
+                            .lock()
+                            .unwrap()
+                            .post_late_warnings;
 
-                        gst::element_warning!(
-                            self.pad.parent(),
-                            gst::LibraryError::Settings,
-                            ["Late transcription item, updating PTS"],
-                            details: details
-                        );
+                        if post_late_warnings {
+                            let details = gst::Structure::builder("awstranscriber/late-item")
+                                .field("original-pts", pts)
+                                .field("last-position", last_position)
+                                .build();
+
+                            gst::element_warning!(
+                                self.pad.parent(),
+                                gst::LibraryError::Settings,
+                                ["Late transcription item, updating PTS"],
+                                details: details
+                            );
+                        }
 
                         pts = last_position;
-                        // FIXME if the resulting duration is zero, we might as well not push it.
-                        duration = duration.saturating_sub(delta);
 
                         {
                             let buf_mut = buf.get_mut().unwrap();
@@ -1531,6 +1729,7 @@ impl TranslationPadTask {
         }
 
         let mut events = vec![];
+        let mut unsynced_events = vec![];
 
         {
             let elem_imp = self.elem.imp();
@@ -1548,12 +1747,27 @@ impl TranslationPadTask {
                     .build(),
             );
 
+            unsynced_events.push(
+                gst::event::StreamStart::builder("unsynced-transcription")
+                    .seqnum(self.seqnum)
+                    .build(),
+            );
+
             let caps = gst::Caps::builder("text/x-raw")
                 .field("format", "utf8")
                 .build();
             events.push(gst::event::Caps::builder(&caps).seqnum(self.seqnum).build());
 
+            let caps = gst::Caps::builder("application/x-json").build();
+            unsynced_events.push(gst::event::Caps::builder(&caps).seqnum(self.seqnum).build());
+
             events.push(
+                gst::event::Segment::builder(&pad_state.out_segment)
+                    .seqnum(self.seqnum)
+                    .build(),
+            );
+
+            unsynced_events.push(
                 gst::event::Segment::builder(&pad_state.out_segment)
                     .seqnum(self.seqnum)
                     .build(),
@@ -1569,6 +1783,13 @@ impl TranslationPadTask {
             }
         }
 
+        if let Some(ref unsynced_pad) = self.unsynced_pad {
+            for event in unsynced_events.drain(..) {
+                gst::info!(CAT, obj = unsynced_pad, "Sending {event:?}");
+                let _ = unsynced_pad.push_event(event);
+            }
+        }
+
         self.send_events = false;
 
         Ok(())
@@ -1581,6 +1802,7 @@ struct TranslationPadState {
     out_segment: gst::FormattedSegment<gst::ClockTime>,
     task_abort_handle: Option<AbortHandle>,
     start_time: Option<gst::ClockTime>,
+    unsynced_pad: Option<gst::Pad>,
 }
 
 impl Default for TranslationPadState {
@@ -1590,6 +1812,7 @@ impl Default for TranslationPadState {
             out_segment: Default::default(),
             task_abort_handle: None,
             start_time: None,
+            unsynced_pad: None,
         }
     }
 }
@@ -1607,6 +1830,14 @@ pub struct TranslateSrcPad {
 }
 
 impl TranslateSrcPad {
+    fn set_unsynced_pad(&self, pad: &gst::Pad) {
+        self.state.lock().unwrap().unsynced_pad = Some(pad.clone());
+    }
+
+    fn take_unsynced_pad(&self) -> Option<gst::Pad> {
+        self.state.lock().unwrap().unsynced_pad.take()
+    }
+
     fn start_task(&self) -> Result<(), gst::LoggableError> {
         gst::debug!(CAT, imp = self, "Starting task");
 
@@ -1702,9 +1933,7 @@ impl TranslateSrcPad {
         _mode: gst::PadMode,
         active: bool,
     ) -> Result<(), gst::LoggableError> {
-        if active {
-            pad.imp().start_task()?;
-        } else {
+        if !active {
             pad.imp().stop_task();
         }
 
@@ -1800,7 +2029,17 @@ impl ObjectImpl for TranslateSrcPad {
     fn set_property(&self, _id: usize, value: &glib::Value, pspec: &glib::ParamSpec) {
         match pspec.name() {
             OUTPUT_LANG_CODE_PROPERTY => {
-                self.settings.lock().unwrap().language_code = value.get().unwrap()
+                let language_code: Option<String> = value.get().unwrap();
+
+                self.settings.lock().unwrap().language_code = language_code.clone();
+
+                if let Some(language_code) = language_code {
+                    store_language_tag(self.obj().upcast_ref(), "transcription", &language_code);
+
+                    if let Some(pad) = self.state.lock().unwrap().unsynced_pad.as_ref() {
+                        store_language_tag(pad, "unsynced-transcription", &language_code);
+                    }
+                }
             }
             TRANSLATION_TOKENIZATION_PROPERTY => {
                 self.settings.lock().unwrap().tokenization_method = value.get().unwrap()

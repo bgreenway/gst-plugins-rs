@@ -25,18 +25,18 @@ anyhow = "1"
 chrono = "0.4"
 thiserror = "2"
 futures = "0.3"
-itertools = "0.12"
+itertools = "0.14"
 tokio = { version = "1", features = ["fs", "macros", "rt-multi-thread", "time"] }
 tokio-native-tls = "0.3.0"
 tokio-stream = "0.1.11"
-async-tungstenite = { version = "0.28", features = ["tokio-runtime", "tokio-native-tls", "url"] }
+async-tungstenite = { version = "0.29", features = ["tokio-runtime", "tokio-native-tls", "url"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 fastrand = "2.0"
 gst_plugin_webrtc_protocol = { path="protocol", package = "gst-plugin-webrtc-signalling-protocol" }
 gst_plugin_webrtc_signalling = { path="signalling", package = "gst-plugin-webrtc-signalling" }
 human_bytes = "0.4"
-rand = "0.8"
+rand = "0.9"
 url = "2"
 
 aws-config = { version = "1.0", optional = true }
@@ -52,7 +52,7 @@ data-encoding = {version = "2.3.3", optional = true }
 url-escape = { version = "0.1.1", optional = true }
 
 reqwest = { version = "0.11", features = ["default-tls"], optional = true }
-parse_link_header = {version = "0.3", features = ["url"]}
+parse_link_header = {version = "0.4", features = ["url"]}
 async-recursion = { version = "1.0.0", optional = true }
 
 livekit-protocol = { version = "0.3, < 0.3.4", optional = true }
@@ -80,7 +80,7 @@ path = "src/lib.rs"
 gst-plugin-version-helper.workspace = true
 
 [features]
-default = ["v1_22", "aws", "janus", "livekit", "whip", "web_server"]
+default = ["v1_22", "janus", "whip", "web_server"]
 static = []
 capi = []
 v1_22 = ["gst/v1_22", "gst-app/v1_22", "gst-video/v1_22", "gst-webrtc/v1_22", "gst-sdp/v1_22", "gst-rtp/v1_22"]
@@ -129,3 +129,7 @@ required-features = [ "whip" ]
 
 [[example]]
 name = "webrtcsink-define-encoder-bitrates"
+
+[[example]]
+name = "whipclient"
+required-features = [ "whip" ]

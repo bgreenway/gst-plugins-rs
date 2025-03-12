@@ -13,6 +13,8 @@ use gst::subclass::prelude::*;
 use gst_base::prelude::*;
 use gst_base::subclass::prelude::*;
 
+use num_integer::Integer;
+use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::sync::Mutex;
 
@@ -263,6 +265,18 @@ impl Stream {
         } else {
             10_000
         }
+    }
+
+    fn image_sequence_mode(&self) -> bool {
+        let image_sequence = {
+            self.sinkpad
+                .imp()
+                .settings
+                .lock()
+                .unwrap()
+                .image_sequence_mode
+        };
+        image_sequence
     }
 }
 
@@ -1166,6 +1180,7 @@ impl MP4Mux {
                     delta_frames = super::DeltaFrames::PredictiveOnly;
                 }
                 "image/jpeg" => (),
+                "video/x-raw" => (),
                 "audio/mpeg" => {
                     if !s.has_field_with_type("codec_data", gst::Buffer::static_type()) {
                         gst::error!(CAT, obj = pad, "Received caps without codec_data");
@@ -1618,13 +1633,54 @@ impl AggregatorImpl for MP4Mux {
 
             // ... and then create the ftyp box plus mdat box header so we can start outputting
             // actual data
+
+            let mut major_brand = b"iso4";
+            let mut minor_version = 0u32;
+            let mut compatible_brands: HashSet<&[u8; 4]> = HashSet::new();
+            let mut have_image_sequence = false; // we'll mark true if an image sequence
+            let mut have_only_image_sequence = true; // we'll mark false if video found
+            let variant = self.obj().class().as_ref().variant;
+            for stream in state.streams.iter().as_ref() {
+                let caps_structure = stream.caps.structure(0).unwrap();
+                if let (super::Variant::ISO, "video/x-av1") =
+                    (variant, caps_structure.name().as_str())
+                {
+                    minor_version = 1;
+                    compatible_brands.insert(b"iso4");
+                    compatible_brands.insert(b"av01");
+                }
+                if stream.image_sequence_mode() {
+                    compatible_brands.insert(b"iso8");
+                    compatible_brands.insert(b"unif");
+                    compatible_brands.insert(b"msf1");
+                    have_image_sequence = true;
+                } else {
+                    match caps_structure.name().as_str() {
+                        "video/x-h264" | "video/x-h265" | "video/x-vp8" | "video/x-vp9"
+                        | "video/x-av1" | "image/jpeg" | "video/x-raw" => {
+                            have_only_image_sequence = false;
+                        }
+                        _ => {}
+                    }
+                    match caps_structure.name().as_str() {
+                        "video/x-h264" | "video/x-h265" | "video/x-vp8" | "video/x-vp9"
+                        | "image/jpeg" | "video/x-raw" | "audio/mpeg" | "audio/x-opus"
+                        | "audio/x-flac" | "audio/x-alaw" | "audio/x-mulaw" | "audio/x-adpcm" => {
+                            compatible_brands.insert(b"mp41");
+                            compatible_brands.insert(b"mp42");
+                            compatible_brands.insert(b"isom");
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if have_image_sequence && have_only_image_sequence {
+                major_brand = b"msf1";
+            }
             let ftyp = boxes::create_ftyp(
-                self.obj().class().as_ref().variant,
-                &state
-                    .streams
-                    .iter()
-                    .map(|s| s.caps.as_ref())
-                    .collect::<Vec<_>>(),
+                major_brand,
+                minor_version,
+                Vec::from_iter(compatible_brands),
             )
             .map_err(|err| {
                 gst::error!(CAT, imp = self, "Failed to create ftyp box: {err}");
@@ -1693,6 +1749,7 @@ impl AggregatorImpl for MP4Mux {
 
                         Vec::new()
                     }),
+                    image_sequence: stream.image_sequence_mode(),
                     chunks: stream.chunks,
                     extra_header_data: stream.extra_header_data.clone(),
                     orientation: stream.orientation,
@@ -1875,6 +1932,67 @@ impl ElementImpl for ISOMP4Mux {
                         .field("width", gst::IntRange::new(1, u16::MAX as i32))
                         .field("height", gst::IntRange::new(1, u16::MAX as i32))
                         .build(),
+                    gst::Structure::builder("video/x-raw")
+                        // TODO: this could be extended to handle gst_video::VideoMeta for non-default stride and plane offsets
+                        .field(
+                            "format",
+                            // formats that do not use subsampling
+                            // Plus NV12 and NV21 because that works OK with the interleaved planes
+                            gst::List::new([
+                                "IYU2",
+                                "RGB",
+                                "BGR",
+                                "NV12",
+                                "NV21",
+                                "RGBA",
+                                "ARGB",
+                                "ABGR",
+                                "BGRA",
+                                "RGBx",
+                                "BGRx",
+                                "Y444",
+                                "AYUV",
+                                "GRAY8",
+                                "GRAY16_BE",
+                                "GBR",
+                                "RGBP",
+                                "BGRP",
+                                "v308",
+                                "r210",
+                            ]),
+                        )
+                        .field("width", gst::IntRange::new(1, i32::MAX))
+                        .field("height", gst::IntRange::new(1, i32::MAX))
+                        .build(),
+                    gst::Structure::builder("video/x-raw")
+                        // TODO: this could be extended to handle gst_video::VideoMeta for non-default stride and plane offsets
+                        .field(
+                            "format",
+                            // Formats that use horizontal subsampling, but not vertical subsampling (4:2:2 and 4:1:1)
+                            gst::List::new(["Y41B", "NV16", "NV61", "Y42B"]),
+                        )
+                        .field(
+                            "width",
+                            gst::IntRange::with_step(4, i32::MAX.prev_multiple_of(&4), 4),
+                        )
+                        .field("height", gst::IntRange::new(1, i32::MAX))
+                        .build(),
+                    gst::Structure::builder("video/x-raw")
+                        // TODO: this could be extended to handle gst_video::VideoMeta for non-default stride and plane offsets
+                        .field(
+                            "format",
+                            // Formats that use both horizontal and vertical subsampling (4:2:0)
+                            gst::List::new(["I420", "YV12", "YUY2", "YVYU", "UYVY", "VYUY"]),
+                        )
+                        .field(
+                            "width",
+                            gst::IntRange::with_step(4, i32::MAX.prev_multiple_of(&4), 4),
+                        )
+                        .field(
+                            "height",
+                            gst::IntRange::with_step(2, i32::MAX.prev_multiple_of(&2), 2),
+                        )
+                        .build(),
                     gst::Structure::builder("audio/mpeg")
                         .field("mpegversion", 4i32)
                         .field("stream-format", "raw")
@@ -2018,6 +2136,7 @@ impl MP4MuxImpl for ONVIFMP4Mux {
 #[derive(Default, Clone)]
 struct PadSettings {
     trak_timescale: u32,
+    image_sequence_mode: bool,
 }
 
 #[derive(Default)]
@@ -2035,11 +2154,18 @@ impl ObjectSubclass for MP4MuxPad {
 impl ObjectImpl for MP4MuxPad {
     fn properties() -> &'static [glib::ParamSpec] {
         static PROPERTIES: LazyLock<Vec<glib::ParamSpec>> = LazyLock::new(|| {
-            vec![glib::ParamSpecUInt::builder("trak-timescale")
-                .nick("Track Timescale")
-                .blurb("Timescale to use for the track (units per second, 0 is automatic)")
-                .mutable_ready()
-                .build()]
+            vec![
+                glib::ParamSpecUInt::builder("trak-timescale")
+                    .nick("Track Timescale")
+                    .blurb("Timescale to use for the track (units per second, 0 is automatic)")
+                    .mutable_ready()
+                    .build(),
+                glib::ParamSpecBoolean::builder("image-sequence")
+                    .nick("Generate image sequence")
+                    .blurb("Generate ISO/IEC 23008-12 image sequence instead of video")
+                    .mutable_ready()
+                    .build(),
+            ]
         });
 
         &PROPERTIES
@@ -2052,6 +2178,11 @@ impl ObjectImpl for MP4MuxPad {
                 settings.trak_timescale = value.get().expect("type checked upstream");
             }
 
+            "image-sequence" => {
+                let mut settings = self.settings.lock().unwrap();
+                settings.image_sequence_mode = value.get().expect("type checked upstream");
+            }
+
             _ => unimplemented!(),
         }
     }
@@ -2061,6 +2192,11 @@ impl ObjectImpl for MP4MuxPad {
             "trak-timescale" => {
                 let settings = self.settings.lock().unwrap();
                 settings.trak_timescale.to_value()
+            }
+
+            "image-sequence" => {
+                let settings = self.settings.lock().unwrap();
+                settings.image_sequence_mode.to_value()
             }
 
             _ => unimplemented!(),

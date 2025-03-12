@@ -12,7 +12,7 @@ use anyhow::{anyhow, Error};
 use gst::glib;
 use gst::prelude::*;
 use gst::subclass::prelude::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 use std::sync::LazyLock;
@@ -38,6 +38,7 @@ const DEFAULT_INPUT_LANG_CODE: &str = "en-US";
 const DEFAULT_MUX_METHOD: MuxMethod = MuxMethod::Cea608;
 
 const CEAX08MUX_LATENCY: gst::ClockTime = gst::ClockTime::from_mseconds(100);
+const CCCOMBINER_LATENCY: gst::ClockTime = gst::ClockTime::from_mseconds(100);
 
 #[derive(Debug)]
 enum TargetPassthroughState {
@@ -46,40 +47,92 @@ enum TargetPassthroughState {
     Disabled,
 }
 
+#[derive(Debug)]
+enum PassthroughState {
+    Enabled,
+    Disabled,
+}
+
+#[derive(Debug)]
+enum CaptionChannelUpdate {
+    Upsert(HashSet<String>),
+    Remove,
+}
+
+#[derive(Debug)]
+enum CustomChannelUpdate {
+    Upsert(String),
+    Remove,
+}
+
+fn parse_language_pair(
+    mux_method: MuxMethod,
+    key: &str,
+    value: &gst::glib::Value,
+) -> Result<(String, HashSet<String>), Error> {
+    let lowercased_key = key.to_lowercase();
+    Ok(match mux_method {
+        MuxMethod::Cea608 => {
+            if ["cc1", "cc3"].contains(&lowercased_key.as_str()) {
+                (
+                    value.get::<String>()?,
+                    HashSet::from([lowercased_key.to_string()]),
+                )
+            } else if let Ok(caption_stream) = value.get::<String>() {
+                if !["cc1", "cc3"].contains(&caption_stream.as_str()) {
+                    anyhow::bail!(
+                        "Unknown 608 channel {}, valid values are cc1, cc3",
+                        caption_stream
+                    );
+                }
+                (key.to_string(), HashSet::from([caption_stream]))
+            } else {
+                anyhow::bail!("Unknown 608 channel/language {}", key);
+            }
+        }
+        MuxMethod::Cea708 => {
+            if let Ok(caption_stream) = value.get::<String>() {
+                (key.to_string(), HashSet::from([caption_stream]))
+            } else if let Ok(caption_streams) = value.get::<gst::List>() {
+                let mut streams = HashSet::new();
+                for s in caption_streams.iter() {
+                    let service = s.get::<String>()?;
+                    if ["cc1", "cc3"].contains(&service.as_str()) || service.starts_with("708_") {
+                        streams.insert(service);
+                    } else {
+                        anyhow::bail!(
+                            "Unknown 708 service {}, valid values are cc1, cc3 or 708_*",
+                            key
+                        );
+                    }
+                }
+                (key.to_string(), streams)
+            } else {
+                anyhow::bail!("Unknown 708 translation language field {}", key);
+            }
+        }
+    })
+}
+
 /* One per language, including original */
-struct TranscriptionChannel {
+#[derive(Clone)]
+struct CaptionChannel {
     bin: gst::Bin,
     textwrap: gst::Element,
     tttoceax08: gst::Element,
     language: String,
     ccmux_pad_name: String,
+    cccapsfilter: gst::Element,
+    caption_streams: HashSet<String>,
 }
 
-impl TranscriptionChannel {
-    fn link_transcriber(&self, transcriber: &gst::Element) -> Result<(), Error> {
-        let transcriber_src_pad = match self.language.as_str() {
-            "transcript" => transcriber
-                .static_pad("src")
-                .ok_or(anyhow!("Failed to retrieve transcription source pad"))?,
-            language => {
-                let pad = transcriber
-                    .request_pad_simple("translate_src_%u")
-                    .ok_or(anyhow!("Failed to request translation source pad"))?;
-                pad.set_property("language-code", language);
-                pad
-            }
-        };
-
-        gst::debug!(
-            CAT,
-            obj = transcriber,
-            "Linking transcriber source pad {transcriber_src_pad:?} to channel"
-        );
-
-        transcriber_src_pad.link(&self.bin.static_pad("sink").unwrap())?;
-
-        Ok(())
-    }
+#[derive(Clone)]
+struct CustomOutputChannel {
+    bin_description: String,
+    bin: gst::Bin,
+    language: String,
+    latency: gst::ClockTime,
+    suffix: String,
 }
 
 /* Locking order: State, Settings, PadState, PadSettings */
@@ -136,13 +189,249 @@ pub struct TranscriberBin {
     settings: Mutex<Settings>,
 }
 
+fn query_latency(element: &gst::Element) -> Result<gst::ClockTime, Error> {
+    let fakesrc = gst::ElementFactory::make("fakesrc")
+        .property("is-live", true)
+        .build()?;
+
+    let Some(srcpad) = element.src_pads().first().cloned() else {
+        return Err(anyhow!(
+            "querying latency on element with no source pad unsupported"
+        ));
+    };
+
+    fakesrc.link(element)?;
+
+    let mut q = gst::query::Latency::new();
+
+    let handled = srcpad.query(&mut q);
+
+    fakesrc.unlink(element);
+
+    if !handled {
+        return Err(anyhow!("impossible to query latency"));
+    }
+
+    let (_live, min, _max) = q.result();
+
+    Ok(min)
+}
+
 impl TranscriberBin {
-    fn construct_channel_bin(
+    fn configure_transcriber(&self, transcriber: &gst::Element) {
+        let settings = self.settings.lock().unwrap();
+        let latency_ms = settings.latency.mseconds() as u32;
+
+        if transcriber.has_property_with_type("transcribe-latency", u32::static_type()) {
+            transcriber.set_property("transcribe-latency", latency_ms);
+        } else if transcriber.has_property_with_type("latency", u32::static_type()) {
+            transcriber.set_property("latency", latency_ms);
+        }
+
+        if transcriber.has_property_with_type("translate-latency", u32::static_type()) {
+            let translate_latency_ms = settings.translate_latency.mseconds() as u32;
+            transcriber.set_property("translate-latency", translate_latency_ms);
+        }
+        if transcriber.has_property_with_type("lateness", u32::static_type()) {
+            let lateness_ms = settings.lateness.mseconds() as u32;
+            transcriber.set_property("lateness", lateness_ms);
+        }
+    }
+
+    fn link_transcriber_to_channel(
+        &self,
+        topbin: &super::TranscriberBin,
+        state: &State,
+        pad_state: &TranscriberSinkPadState,
+        language: &str,
+        channel_bin: &gst::Bin,
+    ) -> Result<(), Error> {
+        let Some(ref transcriber) = pad_state.transcriber else {
+            return Err(anyhow!("no transcriber to link"));
+        };
+
+        let language_tee = pad_state
+            .language_tees
+            .get(language)
+            .expect("language tee created");
+
+        let sinkpad = if let Some(filter) = pad_state.language_filters.get(language) {
+            filter.static_pad("sink").unwrap()
+        } else {
+            language_tee.static_pad("sink").unwrap()
+        };
+
+        if !sinkpad.is_linked() {
+            let transcriber_src_pad = match language {
+                "transcript" => transcriber
+                    .static_pad("src")
+                    .ok_or(anyhow!("Failed to retrieve transcription source pad"))?,
+                language => {
+                    let pad = transcriber
+                        .request_pad_simple("translate_src_%u")
+                        .ok_or(anyhow!("Failed to request translation source pad"))?;
+                    pad.set_property("language-code", language);
+                    pad
+                }
+            };
+
+            gst::debug!(
+                CAT,
+                obj = transcriber_src_pad,
+                "Linking transcriber source pad to language tee"
+            );
+
+            transcriber_src_pad.link(&sinkpad)?;
+
+            pad_state.expose_unsynced_pads(topbin, state, transcriber_src_pad.name().as_str())?;
+        }
+
+        let tee_srcpad = language_tee.request_pad_simple("src_%u").unwrap();
+
+        gst::debug!(CAT, obj = tee_srcpad, "Linking language tee to channel");
+
+        tee_srcpad.link(&channel_bin.static_pad("sink").unwrap())?;
+
+        Ok(())
+    }
+
+    fn link_transcriber_to_channels(
+        &self,
+        state: &State,
+        pad_state: &TranscriberSinkPadState,
+    ) -> Result<(), Error> {
+        for (language, bin) in itertools::chain!(
+            pad_state
+                .caption_channels
+                .values()
+                .map(|c| (c.language.as_str(), c.bin.clone())),
+            pad_state
+                .synthesis_channels
+                .values()
+                .map(|c| (c.language.as_str(), c.bin.clone())),
+            pad_state
+                .subtitle_channels
+                .values()
+                .map(|c| (c.language.as_str(), c.bin.clone())),
+        ) {
+            self.link_transcriber_to_channel(&self.obj(), state, pad_state, language, &bin)?;
+        }
+
+        Ok(())
+    }
+
+    fn expose_channel_outputs(
+        &self,
+        state: &State,
+        pad_state: &TranscriberSinkPadState,
+        pad_settings: &TranscriberSinkPadSettings,
+    ) -> Result<(), Error> {
+        for channel in pad_state.caption_channels.values() {
+            pad_state.link_transcription_channel(channel, state, pad_settings.passthrough)?;
+        }
+
+        for channel in itertools::chain!(
+            pad_state.synthesis_channels.values(),
+            pad_state.subtitle_channels.values()
+        ) {
+            self.expose_custom_output_pads(
+                &pad_state.transcription_bin,
+                &state.transcription_bin,
+                &state.internal_bin,
+                pad_state.serial,
+                channel,
+            )?;
+        }
+
+        Ok(())
+    }
+
+    fn construct_synthesis_channel(
+        &self,
+        lang: &str,
+        accumulate_time: gst::ClockTime,
+        bin_description: &str,
+    ) -> Result<CustomOutputChannel, Error> {
+        let bin = gst::Bin::new();
+        let queue = gst::ElementFactory::make("queue").build()?;
+        let textwrap = gst::ElementFactory::make("textwrap").build()?;
+        let synthesizer = gst::parse::bin_from_description_full(
+            bin_description,
+            true,
+            None,
+            gst::ParseFlags::NO_SINGLE_ELEMENT_BINS,
+        )?;
+
+        let latency = query_latency(&synthesizer)?;
+
+        bin.add_many([&queue, &textwrap, &synthesizer])?;
+        gst::Element::link_many([&queue, &textwrap, &synthesizer])?;
+
+        queue.set_property("max-size-buffers", 0u32);
+        queue.set_property("max-size-time", 0u64);
+
+        textwrap.set_property("lines", 1u32);
+        textwrap.set_property("columns", u32::MAX);
+        textwrap.set_property("accumulate-time", accumulate_time);
+
+        let sinkpad = gst::GhostPad::with_target(&queue.static_pad("sink").unwrap()).unwrap();
+        bin.add_pad(&sinkpad)?;
+
+        let srcpad = gst::GhostPad::with_target(&synthesizer.static_pad("src").unwrap()).unwrap();
+        bin.add_pad(&srcpad)?;
+
+        Ok(CustomOutputChannel {
+            bin_description: bin_description.to_string(),
+            bin,
+            language: String::from(lang),
+            latency,
+            suffix: "synthesis".to_string(),
+        })
+    }
+
+    fn construct_subtitle_channel(
+        &self,
+        lang: &str,
+        bin_description: &str,
+    ) -> Result<CustomOutputChannel, Error> {
+        let bin = gst::Bin::new();
+        let queue = gst::ElementFactory::make("queue").build()?;
+        let processor = gst::parse::bin_from_description_full(
+            bin_description,
+            true,
+            None,
+            gst::ParseFlags::NO_SINGLE_ELEMENT_BINS,
+        )?;
+
+        let latency = query_latency(&processor)?;
+
+        bin.add_many([&queue, &processor])?;
+        gst::Element::link_many([&queue, &processor])?;
+
+        queue.set_property("max-size-buffers", 0u32);
+        queue.set_property("max-size-time", 0u64);
+
+        let sinkpad = gst::GhostPad::with_target(&queue.static_pad("sink").unwrap()).unwrap();
+        bin.add_pad(&sinkpad)?;
+
+        let srcpad = gst::GhostPad::with_target(&processor.static_pad("src").unwrap()).unwrap();
+        bin.add_pad(&srcpad)?;
+
+        Ok(CustomOutputChannel {
+            bin_description: bin_description.to_string(),
+            bin,
+            language: String::from(lang),
+            latency,
+            suffix: "subtitle".to_string(),
+        })
+    }
+
+    fn construct_transcription_channel(
         &self,
         lang: &str,
         mux_method: MuxMethod,
-        caption_streams: Vec<String>,
-    ) -> Result<TranscriptionChannel, Error> {
+        caption_streams: HashSet<String>,
+    ) -> Result<CaptionChannel, Error> {
         let bin = gst::Bin::new();
         let queue = gst::ElementFactory::make("queue").build()?;
         let textwrap = gst::ElementFactory::make("textwrap").build()?;
@@ -153,7 +442,7 @@ impl TranscriberBin {
                 }
                 (
                     gst::ElementFactory::make("tttocea608").build()?,
-                    caption_streams[0].clone(),
+                    caption_streams.iter().next().unwrap().clone(),
                 )
             }
             MuxMethod::Cea708 => {
@@ -202,11 +491,11 @@ impl TranscriberBin {
                 (builder.build()?, format!("sink_{}", service_no))
             }
         };
-        let capsfilter = gst::ElementFactory::make("capsfilter").build()?;
+        let cccapsfilter = gst::ElementFactory::make("capsfilter").build()?;
         let converter = gst::ElementFactory::make("ccconverter").build()?;
 
-        bin.add_many([&queue, &textwrap, &tttoceax08, &capsfilter, &converter])?;
-        gst::Element::link_many([&queue, &textwrap, &tttoceax08, &capsfilter, &converter])?;
+        bin.add_many([&queue, &textwrap, &tttoceax08, &cccapsfilter, &converter])?;
+        gst::Element::link_many([&queue, &textwrap, &tttoceax08, &cccapsfilter, &converter])?;
 
         queue.set_property("max-size-buffers", 0u32);
         queue.set_property("max-size-time", 0u64);
@@ -216,27 +505,29 @@ impl TranscriberBin {
         let caps = match mux_method {
             MuxMethod::Cea608 => gst::Caps::builder("closedcaption/x-cea-608")
                 .field("format", "raw")
-                .field("framerate", gst::Fraction::new(30000, 1001))
+                .field("framerate", gst::Fraction::new(30, 1))
                 .build(),
             MuxMethod::Cea708 => gst::Caps::builder("closedcaption/x-cea-708")
                 .field("format", "cc_data")
-                .field("framerate", gst::Fraction::new(30000, 1001))
+                .field("framerate", gst::Fraction::new(30, 1))
                 .build(),
         };
 
-        capsfilter.set_property("caps", caps);
+        cccapsfilter.set_property("caps", caps);
 
         let sinkpad = gst::GhostPad::with_target(&queue.static_pad("sink").unwrap()).unwrap();
         let srcpad = gst::GhostPad::with_target(&converter.static_pad("src").unwrap()).unwrap();
         bin.add_pad(&sinkpad)?;
         bin.add_pad(&srcpad)?;
 
-        Ok(TranscriptionChannel {
+        Ok(CaptionChannel {
             bin,
             textwrap,
             tttoceax08,
             language: String::from(lang),
             ccmux_pad_name,
+            cccapsfilter,
+            caption_streams,
         })
     }
 
@@ -245,6 +536,7 @@ impl TranscriberBin {
         pad_name: &str,
         pad_state: &TranscriberSinkPadState,
         state: &mut State,
+        pad_settings: &TranscriberSinkPadSettings,
     ) -> Result<(), Error> {
         gst::debug!(CAT, imp = self, "Linking input audio stream {pad_name}");
 
@@ -317,28 +609,9 @@ impl TranscriberBin {
             .transcription_bin
             .add_pad(&transcription_audio_sinkpad)?;
 
-        for channel in pad_state.transcription_channels.values() {
-            pad_state.transcription_bin.add(&channel.bin)?;
+        self.link_transcriber_to_channels(state, pad_state)?;
 
-            if let Some(ref transcriber) = pad_state.transcriber {
-                channel.link_transcriber(transcriber)?;
-            }
-
-            let srcpad =
-                gst::GhostPad::builder_with_target(&channel.bin.static_pad("src").unwrap())
-                    .unwrap()
-                    .name(format!("src_{}", channel.language))
-                    .build();
-
-            pad_state.transcription_bin.add_pad(&srcpad)?;
-            if state.ccmux.static_pad(&channel.ccmux_pad_name).is_none() {
-                let ccmux_pad = state
-                    .ccmux
-                    .request_pad_simple(&channel.ccmux_pad_name)
-                    .ok_or(anyhow!("Failed to request ccmux sink pad"))?;
-                srcpad.link(&ccmux_pad)?;
-            }
-        }
+        self.expose_channel_outputs(state, pad_state, pad_settings)?;
 
         Ok(())
     }
@@ -434,7 +707,7 @@ impl TranscriberBin {
 
         self.obj().add(&state.internal_bin)?;
 
-        state.cccombiner.set_property("latency", 100.mseconds());
+        state.cccombiner.set_property("latency", CCCOMBINER_LATENCY);
 
         self.video_sinkpad
             .set_target(Some(&state.internal_bin.static_pad("video_sink").unwrap()))?;
@@ -450,8 +723,9 @@ impl TranscriberBin {
         // FIXME: replace this pattern with https://doc.rust-lang.org/nightly/std/sync/struct.MappedMutexGuard.html
         let ps = pad.imp().state.lock().unwrap();
         let pad_state = ps.as_ref().unwrap();
+        let pad_settings = pad.imp().settings.lock().unwrap();
 
-        self.link_input_audio_stream("sink_audio", pad_state, state)?;
+        self.link_input_audio_stream("sink_audio", pad_state, state, &pad_settings)?;
 
         let internal_audio_sinkpad =
             gst::GhostPad::builder_with_target(&pad_state.clocksync.static_pad("sink").unwrap())
@@ -498,10 +772,27 @@ impl TranscriberBin {
 
         state.ccmux_filter.set_property("caps", ccmux_caps);
 
-        let max_size_time = settings.latency
-            + settings.translate_latency
-            + settings.accumulate_time
-            + CEAX08MUX_LATENCY;
+        let caps = match state.mux_method {
+            MuxMethod::Cea608 => gst::Caps::builder("closedcaption/x-cea-608")
+                .field("format", "raw")
+                .field("framerate", state.framerate.unwrap())
+                .build(),
+            MuxMethod::Cea708 => gst::Caps::builder("closedcaption/x-cea-708")
+                .field("format", "cc_data")
+                .field("framerate", state.framerate.unwrap())
+                .build(),
+        };
+
+        for pad in state.audio_sink_pads.values() {
+            let ps = pad.imp().state.lock().unwrap();
+            if let Ok(pad_state) = ps.as_ref() {
+                for channel in pad_state.caption_channels.values() {
+                    channel.cccapsfilter.set_property("caps", &caps);
+                }
+            }
+        }
+
+        let max_size_time = self.our_latency(state, &settings);
 
         gst::debug!(
             CAT,
@@ -521,17 +812,17 @@ impl TranscriberBin {
             if let Some(ref transcriber) = pad_state.transcriber {
                 let latency_ms = settings.latency.mseconds() as u32;
 
-                if transcriber.has_property("transcribe-latency", Some(u32::static_type())) {
+                if transcriber.has_property_with_type("transcribe-latency", u32::static_type()) {
                     transcriber.set_property("transcribe-latency", latency_ms);
-                } else if transcriber.has_property("latency", Some(u32::static_type())) {
+                } else if transcriber.has_property_with_type("latency", u32::static_type()) {
                     transcriber.set_property("latency", latency_ms);
                 }
 
-                if transcriber.has_property("translate-latency", Some(u32::static_type())) {
+                if transcriber.has_property_with_type("translate-latency", u32::static_type()) {
                     let translate_latency_ms = settings.translate_latency.mseconds() as u32;
                     transcriber.set_property("translate-latency", translate_latency_ms);
                 }
-                if transcriber.has_property("lateness", Some(u32::static_type())) {
+                if transcriber.has_property_with_type("lateness", u32::static_type()) {
                     let lateness_ms = settings.lateness.mseconds() as u32;
                     transcriber.set_property("lateness", lateness_ms);
                 }
@@ -557,19 +848,33 @@ impl TranscriberBin {
             .link_pads(Some("src"), &state.cccombiner, Some("caption"))
             .unwrap();
 
+        // We don't need to sync below playing as the state is now unlocked
+        // and the bin will transition when necessary.
+        //
+        // Trying to sync in PAUSED was causing issues with base time distribution,
+        // with cea608mux selecting an incorrect start time.
+        let do_sync = self.obj().current_state() == gst::State::Playing;
+
         state.transcription_bin.set_locked_state(false);
-        state.transcription_bin.sync_state_with_parent().unwrap();
+        if do_sync {
+            state.transcription_bin.sync_state_with_parent().unwrap();
+        }
 
         for pad in state.audio_sink_pads.values() {
             let ps = pad.imp().state.lock().unwrap();
             let pad_state = ps.as_ref().unwrap();
-            pad_state.transcription_bin.set_locked_state(false);
-            pad_state
-                .transcription_bin
-                .sync_state_with_parent()
-                .unwrap();
             let pad_settings = pad.imp().settings.lock().unwrap();
+
             if !pad_settings.passthrough {
+                pad_state.transcription_bin.set_locked_state(false);
+
+                if do_sync {
+                    pad_state
+                        .transcription_bin
+                        .sync_state_with_parent()
+                        .unwrap();
+                }
+
                 let transcription_sink_pad =
                     state.transcription_bin.static_pad(&pad.name()).unwrap();
                 // Might be linked already if "translation-languages" is set
@@ -584,7 +889,13 @@ impl TranscriberBin {
             let ps = pad.imp().state.lock().unwrap();
             let pad_state = ps.as_ref().unwrap();
             let pad_settings = pad.imp().settings.lock().unwrap();
-            self.setup_cc_mode(pad, pad_state, state.mux_method, pad_settings.mode);
+            self.setup_cc_mode(
+                pad,
+                pad_state,
+                state.mux_method,
+                pad_settings.mode,
+                settings.accumulate_time,
+            );
         }
     }
 
@@ -594,6 +905,11 @@ impl TranscriberBin {
         state: &mut State,
         pad_state: &mut TranscriberSinkPadState,
     ) {
+        if matches!(pad_state.passthrough_state, PassthroughState::Enabled) {
+            gst::log!(CAT, obj = pad, "passthrough was already enabled");
+            return;
+        }
+
         gst::debug!(CAT, imp = self, "disabling transcription bin");
 
         let bin_sink_pad = state.transcription_bin.static_pad(&pad.name()).unwrap();
@@ -605,7 +921,7 @@ impl TranscriberBin {
             pad_state.audio_tee.release_request_pad(&audio_tee_pad);
         }
 
-        for channel in pad_state.transcription_channels.values() {
+        for channel in pad_state.caption_channels.values() {
             let srcpad = pad_state
                 .transcription_bin
                 .static_pad(&format!("src_{}", channel.language))
@@ -622,6 +938,9 @@ impl TranscriberBin {
             .transcription_bin
             .set_state(gst::State::Null)
             .unwrap();
+
+        pad_state.target_passthrough_state = TargetPassthroughState::None;
+        pad_state.passthrough_state = PassthroughState::Enabled;
     }
 
     fn enable_transcription_bin(
@@ -630,9 +949,14 @@ impl TranscriberBin {
         state: &mut State,
         pad_state: &mut TranscriberSinkPadState,
     ) {
+        if matches!(pad_state.passthrough_state, PassthroughState::Disabled) {
+            gst::log!(CAT, imp = sinkpad, "passthrough was already disabled");
+            return;
+        }
+
         gst::debug!(CAT, imp = sinkpad, "enabling transcription bin");
 
-        for channel in pad_state.transcription_channels.values() {
+        for channel in pad_state.caption_channels.values() {
             let srcpad = pad_state
                 .transcription_bin
                 .static_pad(&format!("src_{}", channel.language))
@@ -668,6 +992,7 @@ impl TranscriberBin {
             .unwrap();
         audio_tee_pad.link(&transcription_sink_pad).unwrap();
         pad_state.target_passthrough_state = TargetPassthroughState::None;
+        pad_state.passthrough_state = PassthroughState::Disabled;
     }
 
     fn block_and_update(
@@ -718,7 +1043,6 @@ impl TranscriberBin {
                         match pad_state.target_passthrough_state {
                             TargetPassthroughState::Enabled => {
                                 imp.disable_transcription_bin(pad, state, pad_state);
-                                pad_state.target_passthrough_state = TargetPassthroughState::None;
                                 // Now that we are done, make sure that this is reflected in our settings
                                 let notify = {
                                     let mut pad_settings = pad_imp.settings.lock().unwrap();
@@ -767,6 +1091,7 @@ impl TranscriberBin {
         pad_state: &TranscriberSinkPadState,
         mux_method: MuxMethod,
         mode: Cea608Mode,
+        accumulate_time: gst::ClockTime,
     ) {
         gst::debug!(
             CAT,
@@ -776,7 +1101,7 @@ impl TranscriberBin {
             pad
         );
 
-        for channel in pad_state.transcription_channels.values() {
+        for channel in pad_state.caption_channels.values() {
             match mux_method {
                 MuxMethod::Cea608 => channel.tttoceax08.set_property("mode", mode),
                 MuxMethod::Cea708 => match mode {
@@ -793,8 +1118,6 @@ impl TranscriberBin {
             if mode.is_rollup() {
                 channel.textwrap.set_property("accumulate-time", 0u64);
             } else {
-                let accumulate_time = self.settings.lock().unwrap().accumulate_time;
-
                 channel
                     .textwrap
                     .set_property("accumulate-time", accumulate_time);
@@ -806,7 +1129,7 @@ impl TranscriberBin {
      * be called in READY */
     fn relink_transcriber(
         &self,
-        state: &mut State,
+        state: &State,
         pad_state: &TranscriberSinkPadState,
         old_transcriber: Option<&gst::Element>,
     ) -> Result<(), Error> {
@@ -819,95 +1142,906 @@ impl TranscriberBin {
         );
 
         if let Some(old_transcriber) = old_transcriber {
-            gst::debug!(
-                CAT,
-                imp = self,
-                "Unlinking old transcriber {old_transcriber:?}"
-            );
+            gst::debug!(CAT, obj = old_transcriber, "Unlinking old transcriber");
             pad_state.transcriber_aconv.unlink(old_transcriber);
-            for channel in pad_state.transcription_channels.values() {
-                old_transcriber.unlink(&channel.bin);
-            }
-            let _ = state.transcription_bin.remove(old_transcriber);
+            pad_state.unlink_language_tees(self.obj().as_ref(), state, pad_state);
+            let _ = pad_state.transcription_bin.remove(old_transcriber);
             old_transcriber.set_state(gst::State::Null).unwrap();
         }
 
         if let Some(ref transcriber) = pad_state.transcriber {
-            gst::debug!(CAT, imp = self, "Linking new transcriber {transcriber:?}");
+            gst::debug!(CAT, obj = transcriber, "Linking new transcriber");
             pad_state.transcription_bin.add(transcriber)?;
             transcriber.sync_state_with_parent().unwrap();
             pad_state.transcriber_aconv.link(transcriber)?;
 
-            for channel in pad_state.transcription_channels.values() {
-                channel.link_transcriber(transcriber)?;
+            self.link_transcriber_to_channels(state, pad_state)?;
+        }
+
+        Ok(())
+    }
+
+    fn construct_channels(
+        &self,
+        accumulate_time: gst::ClockTime,
+        mux_method: MuxMethod,
+        pad_state: &mut TranscriberSinkPadState,
+        pad_settings: &TranscriberSinkPadSettings,
+    ) -> Result<(), Error> {
+        self.construct_caption_channels(pad_settings, mux_method, pad_state)
+            .unwrap();
+
+        self.construct_synthesis_channels(accumulate_time, pad_settings, pad_state)
+            .unwrap();
+
+        self.construct_subtitle_channels(pad_settings, pad_state)
+            .unwrap();
+
+        for k in pad_state
+            .caption_channels
+            .keys()
+            .chain(pad_state.synthesis_channels.keys())
+            .chain(pad_state.subtitle_channels.keys())
+        {
+            use std::collections::hash_map::Entry::*;
+            if let Vacant(e) = pad_state.language_tees.entry(k.clone()) {
+                let tee = gst::ElementFactory::make("tee")
+                    .name(format!("tee-{}", k))
+                    .property("allow-not-linked", true)
+                    .build()?;
+
+                pad_state.transcription_bin.add(&tee)?;
+
+                if let Some(val) = pad_settings
+                    .language_filters
+                    .as_ref()
+                    .and_then(|f| f.value(k).ok())
+                {
+                    let filter = if val.is::<String>() {
+                        let bin_description = val.get::<String>().unwrap();
+                        gst::parse::bin_from_description_full(
+                            &bin_description,
+                            true,
+                            None,
+                            gst::ParseFlags::NO_SINGLE_ELEMENT_BINS,
+                        )?
+                    } else if val.is::<gst::Element>() {
+                        val.get::<gst::Element>().unwrap()
+                    } else {
+                        return Err(anyhow!(
+                            "Value for language filter map must be string or element"
+                        ));
+                    };
+
+                    pad_state.transcription_bin.add(&filter)?;
+                    filter.link(&tee)?;
+                    pad_state.language_filters.insert(k.clone(), filter);
+                }
+
+                e.insert(tee);
+            };
+        }
+
+        Ok(())
+    }
+
+    fn tear_down_channels(
+        &self,
+        state: &State,
+        pad_state: &mut TranscriberSinkPadState,
+    ) -> Result<(), Error> {
+        pad_state.unlink_language_tees(self.obj().as_ref(), state, pad_state);
+
+        self.tear_down_caption_channels(state, pad_state)?;
+
+        self.tear_down_synthesis_channels(state, pad_state)?;
+
+        self.tear_down_subtitle_channels(state, pad_state)?;
+
+        for (language, tee) in pad_state.language_tees.drain() {
+            if let Some(filter) = pad_state.language_filters.remove(&language) {
+                let _ = pad_state.transcription_bin.remove(&filter);
+                let _ = filter.set_state(gst::State::Null);
+                // At this point the filter is unlinked, removed from the bin and
+                // its state is reset. If it was directly provided by the user then
+                // it remains reffed in the settings structure, otherwise it goes
+                // out of scope here and will get recreated.
+            }
+            let _ = pad_state.transcription_bin.remove(&tee);
+        }
+
+        Ok(())
+    }
+
+    fn tear_down_custom_output_channel(
+        &self,
+        channel: CustomOutputChannel,
+        pad_transcription_bin: &gst::Bin,
+        transcription_bin: &gst::Bin,
+        internal_bin: &gst::Bin,
+        serial: Option<u32>,
+    ) -> Result<(), Error> {
+        let mut pad_name = format!("src_{}_{}", channel.suffix, channel.language);
+        let srcpad = pad_transcription_bin.static_pad(&pad_name).unwrap();
+
+        let _ = pad_transcription_bin.remove_pad(&srcpad);
+
+        let channel_sinkpad = channel.bin.static_pad("sink").unwrap();
+
+        if let Some(tee_srcpad) = channel_sinkpad.peer() {
+            let _ = tee_srcpad.unlink(&channel_sinkpad);
+            if let Some(tee) = tee_srcpad
+                .parent()
+                .and_then(|p| p.downcast::<gst::Element>().ok())
+            {
+                let _ = tee.remove_pad(&tee_srcpad);
+            }
+        }
+
+        pad_transcription_bin.remove(&channel.bin)?;
+
+        let _ = channel.bin.set_state(gst::State::Null);
+
+        if let Some(serial) = serial {
+            pad_name = format!("{}_{}", pad_name, serial);
+        }
+        let srcpad = transcription_bin.static_pad(&pad_name).unwrap();
+        let _ = transcription_bin.remove_pad(&srcpad);
+
+        let srcpad = internal_bin.static_pad(&pad_name).unwrap();
+        let _ = internal_bin.remove_pad(&srcpad);
+        let srcpad = self.obj().static_pad(&pad_name).unwrap();
+        let _ = self.obj().remove_pad(&srcpad);
+
+        Ok(())
+    }
+
+    fn tear_down_caption_channel(
+        &self,
+        channel: CaptionChannel,
+        pad_transcription_bin: &gst::Bin,
+        ccmux: &gst::Element,
+    ) -> Result<(), Error> {
+        let channel_sinkpad = channel.bin.static_pad("sink").unwrap();
+
+        if let Some(tee_srcpad) = channel_sinkpad.peer() {
+            let _ = tee_srcpad.unlink(&channel_sinkpad);
+            if let Some(tee) = tee_srcpad
+                .parent()
+                .and_then(|p| p.downcast::<gst::Element>().ok())
+            {
+                let _ = tee.remove_pad(&tee_srcpad);
+            }
+        }
+
+        let srcpad = pad_transcription_bin
+            .static_pad(&format!("src_{}", channel.language))
+            .unwrap();
+
+        if let Some(peer) = srcpad.peer() {
+            // The source pad might not have been linked to the muxer initially, for
+            // instance in case of a collision with another source pad's
+            // translation-languages mapping
+            if peer.parent().and_downcast_ref::<gst::Element>() == Some(ccmux) {
+                srcpad.unlink(&peer)?;
+                ccmux.release_request_pad(&peer);
+            }
+        }
+
+        let _ = pad_transcription_bin.remove_pad(&srcpad);
+
+        pad_transcription_bin.remove(&channel.bin)?;
+
+        let _ = channel.bin.set_state(gst::State::Null);
+
+        Ok(())
+    }
+
+    fn tear_down_synthesis_channels(
+        &self,
+        state: &State,
+        pad_state: &mut TranscriberSinkPadState,
+    ) -> Result<(), Error> {
+        let channels: Vec<_> = pad_state.synthesis_channels.drain().collect();
+        for (_, channel) in channels {
+            self.tear_down_custom_output_channel(
+                channel,
+                &pad_state.transcription_bin,
+                &state.transcription_bin,
+                &state.internal_bin,
+                pad_state.serial,
+            )?;
+        }
+
+        Ok(())
+    }
+
+    fn tear_down_subtitle_channels(
+        &self,
+        state: &State,
+        pad_state: &mut TranscriberSinkPadState,
+    ) -> Result<(), Error> {
+        let channels: Vec<_> = pad_state.subtitle_channels.drain().collect();
+        for (_, channel) in channels {
+            self.tear_down_custom_output_channel(
+                channel,
+                &pad_state.transcription_bin,
+                &state.transcription_bin,
+                &state.internal_bin,
+                pad_state.serial,
+            )?;
+        }
+
+        Ok(())
+    }
+
+    fn tear_down_caption_channels(
+        &self,
+        state: &State,
+        pad_state: &mut TranscriberSinkPadState,
+    ) -> Result<(), Error> {
+        let channels: Vec<_> = pad_state.caption_channels.drain().collect();
+
+        for (_, channel) in channels {
+            self.tear_down_caption_channel(channel, &pad_state.transcription_bin, &state.ccmux)?;
+        }
+
+        Ok(())
+    }
+
+    fn construct_synthesis_channels(
+        &self,
+        accumulate_time: gst::ClockTime,
+        pad_settings: &TranscriberSinkPadSettings,
+        pad_state: &mut TranscriberSinkPadState,
+    ) -> Result<(), Error> {
+        if let Some(ref map) = pad_settings.synthesis_languages {
+            for (language, value) in map.iter() {
+                let bin_description = value.get::<String>()?;
+                pad_state.synthesis_channels.insert(
+                    language.to_string(),
+                    self.construct_synthesis_channel(language, accumulate_time, &bin_description)?,
+                );
+            }
+
+            for channel in pad_state.synthesis_channels.values() {
+                pad_state.transcription_bin.add(&channel.bin)?;
             }
         }
 
         Ok(())
     }
 
-    fn construct_transcription_channels(
+    fn construct_subtitle_channels(
+        &self,
+        pad_settings: &TranscriberSinkPadSettings,
+        pad_state: &mut TranscriberSinkPadState,
+    ) -> Result<(), Error> {
+        if let Some(ref map) = pad_settings.subtitle_languages {
+            for (language, value) in map.iter() {
+                let bin_description = value.get::<String>()?;
+                pad_state.subtitle_channels.insert(
+                    language.to_string(),
+                    self.construct_subtitle_channel(language, &bin_description)?,
+                );
+            }
+
+            for channel in pad_state.subtitle_channels.values() {
+                pad_state.transcription_bin.add(&channel.bin)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn construct_caption_channels(
         &self,
         settings: &TranscriberSinkPadSettings,
         mux_method: MuxMethod,
-        transcription_channels: &mut HashMap<String, TranscriptionChannel>,
+        pad_state: &mut TranscriberSinkPadState,
     ) -> Result<(), Error> {
         if let Some(ref map) = settings.translation_languages {
             for (key, value) in map.iter() {
-                let key = key.to_lowercase();
-                let (language_code, caption_streams) = match mux_method {
-                    MuxMethod::Cea608 => {
-                        if ["cc1", "cc3"].contains(&key.as_str()) {
-                            (value.get::<String>()?, vec![key.to_string()])
-                        } else if let Ok(caption_stream) = value.get::<String>() {
-                            if !["cc1", "cc3"].contains(&caption_stream.as_str()) {
-                                anyhow::bail!(
-                                    "Unknown 608 channel {}, valid values are cc1, cc3",
-                                    caption_stream
-                                );
-                            }
-                            (key, vec![caption_stream])
-                        } else {
-                            anyhow::bail!("Unknown 608 channel/language {}", key);
-                        }
-                    }
-                    MuxMethod::Cea708 => {
-                        if let Ok(caption_stream) = value.get::<String>() {
-                            (key, vec![caption_stream])
-                        } else if let Ok(caption_streams) = value.get::<gst::List>() {
-                            let mut streams = vec![];
-                            for s in caption_streams.iter() {
-                                let service = s.get::<String>()?;
-                                if ["cc1", "cc3"].contains(&service.as_str())
-                                    || service.starts_with("708_")
-                                {
-                                    streams.push(service);
-                                } else {
-                                    anyhow::bail!("Unknown 708 service {}, valid values are cc1, cc3 or 708_*", key);
-                                }
-                            }
-                            (key, streams)
-                        } else {
-                            anyhow::bail!("Unknown 708 translation language field {}", key);
-                        }
-                    }
-                };
+                let (language_code, caption_streams) = parse_language_pair(mux_method, key, value)?;
 
-                transcription_channels.insert(
+                pad_state.caption_channels.insert(
                     language_code.to_owned(),
-                    self.construct_channel_bin(&language_code, mux_method, caption_streams)?,
+                    self.construct_transcription_channel(
+                        &language_code,
+                        mux_method,
+                        caption_streams,
+                    )?,
                 );
             }
         } else {
             let caption_streams = match mux_method {
-                MuxMethod::Cea608 => vec!["cc1".to_string()],
-                MuxMethod::Cea708 => vec!["cc1".to_string(), "708_1".to_string()],
+                MuxMethod::Cea608 => HashSet::from(["cc1".to_string()]),
+                MuxMethod::Cea708 => HashSet::from(["cc1".to_string(), "708_1".to_string()]),
             };
-            transcription_channels.insert(
+            pad_state.caption_channels.insert(
                 "transcript".to_string(),
-                self.construct_channel_bin("transcript", mux_method, caption_streams)?,
+                self.construct_transcription_channel("transcript", mux_method, caption_streams)?,
             );
         }
+
+        for channel in pad_state.caption_channels.values() {
+            pad_state.transcription_bin.add(&channel.bin)?;
+        }
+
+        Ok(())
+    }
+
+    fn prepare_caption_channel_updates(
+        &self,
+        state: &State,
+        pad_state: &mut TranscriberSinkPadState,
+        settings: &TranscriberSinkPadSettings,
+    ) -> Result<(Vec<CaptionChannel>, Vec<CaptionChannel>), Error> {
+        let mut updates = HashMap::new();
+        let mut old_languages: HashSet<String> =
+            pad_state.caption_channels.keys().cloned().collect();
+
+        let translation_languages =
+            settings
+                .translation_languages
+                .clone()
+                .unwrap_or(match state.mux_method {
+                    MuxMethod::Cea608 => gst::Structure::builder("languages")
+                        .field("transcript", "cc1")
+                        .build(),
+                    MuxMethod::Cea708 => gst::Structure::builder("languages")
+                        .field(
+                            "transcript",
+                            gst::List::from_values([
+                                "cc1".to_string().to_send_value(),
+                                "708_1".to_string().to_send_value(),
+                            ]),
+                        )
+                        .build(),
+                });
+
+        for (key, value) in translation_languages.iter() {
+            let (language_code, caption_streams) =
+                parse_language_pair(state.mux_method, key, value)?;
+
+            old_languages.remove(&language_code);
+
+            if let Some(channel) = pad_state.caption_channels.get(&language_code) {
+                if channel.caption_streams != caption_streams {
+                    updates.insert(language_code, CaptionChannelUpdate::Upsert(caption_streams));
+                }
+            } else {
+                updates.insert(language_code, CaptionChannelUpdate::Upsert(caption_streams));
+            }
+        }
+
+        for language_code in old_languages.drain() {
+            updates.insert(language_code, CaptionChannelUpdate::Remove);
+        }
+
+        let mut channels_to_remove = vec![];
+        let mut channels_to_add = vec![];
+
+        for (language_code, update) in updates {
+            match update {
+                CaptionChannelUpdate::Remove => {
+                    let transcription_channel =
+                        pad_state.caption_channels.remove(&language_code).unwrap();
+
+                    channels_to_remove.push(transcription_channel);
+
+                    gst::debug!(
+                        CAT,
+                        imp = self,
+                        "caption channel {language_code} will be removed"
+                    );
+                }
+                CaptionChannelUpdate::Upsert(caption_streams) => {
+                    if let Some(transcription_channel) =
+                        pad_state.caption_channels.remove(&language_code)
+                    {
+                        channels_to_remove.push(transcription_channel);
+
+                        gst::debug!(
+                            CAT,
+                            imp = self,
+                            "caption channel {language_code} will be removed"
+                        );
+                    }
+
+                    let transcription_channel = self.construct_transcription_channel(
+                        &language_code,
+                        state.mux_method,
+                        caption_streams,
+                    )?;
+                    channels_to_add.push(transcription_channel.clone());
+                    pad_state
+                        .caption_channels
+                        .insert(language_code.clone(), transcription_channel);
+
+                    gst::debug!(
+                        CAT,
+                        imp = self,
+                        "caption channel {language_code} will be added"
+                    );
+                }
+            }
+        }
+
+        Ok((channels_to_remove, channels_to_add))
+    }
+
+    fn prepare_custom_output_channel_updates(
+        &self,
+        settings: &Settings,
+        languages: &Option<gst::Structure>,
+        channels_map: &mut HashMap<String, CustomOutputChannel>,
+        channel_type_logname: &str,
+    ) -> Result<(Vec<CustomOutputChannel>, Vec<CustomOutputChannel>), Error> {
+        let mut updates = HashMap::new();
+        let mut old_languages: HashSet<String> = channels_map.keys().cloned().collect();
+
+        if let Some(ref map) = languages {
+            for (key, value) in map.iter() {
+                let language_code = key.to_string();
+
+                old_languages.remove(&language_code);
+
+                let bin_description = value.get::<String>()?;
+                if let Some(channel) = channels_map.get(&language_code) {
+                    if channel.bin_description != bin_description {
+                        updates.insert(language_code, CustomChannelUpdate::Upsert(bin_description));
+                    }
+                } else {
+                    updates.insert(language_code, CustomChannelUpdate::Upsert(bin_description));
+                }
+            }
+        }
+
+        for language_code in old_languages.drain() {
+            updates.insert(language_code, CustomChannelUpdate::Remove);
+        }
+
+        let mut channels_to_remove = vec![];
+        let mut channels_to_add = vec![];
+
+        for (language_code, update) in updates {
+            match update {
+                CustomChannelUpdate::Remove => {
+                    let synthesis_channel = channels_map.remove(&language_code).unwrap();
+
+                    channels_to_remove.push(synthesis_channel);
+
+                    gst::debug!(
+                        CAT,
+                        imp = self,
+                        "{channel_type_logname} channel {language_code} will be removed"
+                    );
+                }
+                CustomChannelUpdate::Upsert(bin_description) => {
+                    if let Some(synthesis_channel) = channels_map.remove(&language_code) {
+                        channels_to_remove.push(synthesis_channel);
+
+                        gst::debug!(
+                            CAT,
+                            imp = self,
+                            "{channel_type_logname} channel {language_code} will be removed"
+                        );
+                    }
+
+                    let synthesis_channel = self.construct_synthesis_channel(
+                        &language_code,
+                        settings.accumulate_time,
+                        &bin_description,
+                    )?;
+                    channels_to_add.push(synthesis_channel.clone());
+                    channels_map.insert(language_code.clone(), synthesis_channel);
+
+                    gst::debug!(
+                        CAT,
+                        imp = self,
+                        "{channel_type_logname} channel {language_code} will be added"
+                    );
+                }
+            }
+        }
+
+        Ok((channels_to_remove, channels_to_add))
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn prepare_language_updates(
+        &self,
+        pad_state: &mut TranscriberSinkPadState,
+        pad_settings: &TranscriberSinkPadSettings,
+        mut old_languages: HashSet<String>,
+    ) -> Result<
+        (
+            Vec<(gst::Element, Option<gst::Element>)>,
+            HashMap<String, (gst::Element, Option<gst::Element>)>,
+        ),
+        Error,
+    > {
+        let mut languages_to_add: HashMap<String, (gst::Element, Option<gst::Element>)> =
+            HashMap::new();
+
+        for k in pad_state
+            .caption_channels
+            .keys()
+            .chain(pad_state.synthesis_channels.keys())
+            .chain(pad_state.subtitle_channels.keys())
+        {
+            use std::collections::hash_map::Entry::*;
+            if let Vacant(e) = pad_state.language_tees.entry(k.clone()) {
+                let tee = gst::ElementFactory::make("tee")
+                    .name(format!("tee-{}", k))
+                    .property("allow-not-linked", true)
+                    .build()?;
+
+                if let Some(val) = pad_settings
+                    .language_filters
+                    .as_ref()
+                    .and_then(|f| f.value(k).ok())
+                {
+                    let filter = if val.is::<String>() {
+                        let bin_description = val.get::<String>().unwrap();
+                        gst::parse::bin_from_description_full(
+                            &bin_description,
+                            true,
+                            None,
+                            gst::ParseFlags::NO_SINGLE_ELEMENT_BINS,
+                        )?
+                    } else if val.is::<gst::Element>() {
+                        val.get::<gst::Element>().unwrap()
+                    } else {
+                        return Err(anyhow!(
+                            "Value for language filter map must be string or element"
+                        ));
+                    };
+
+                    languages_to_add.insert(k.clone(), (tee.clone(), Some(filter.clone())));
+                    pad_state.language_filters.insert(k.clone(), filter);
+
+                    gst::debug!(CAT, imp = self, "language {k} will be added");
+                } else {
+                    languages_to_add.insert(k.clone(), (tee.clone(), None));
+
+                    gst::debug!(CAT, imp = self, "language {k} will be added");
+                }
+
+                e.insert(tee);
+            };
+
+            old_languages.remove(k);
+        }
+
+        let mut languages_to_remove: Vec<(gst::Element, Option<gst::Element>)> = vec![];
+
+        for language in old_languages.drain() {
+            if let Some(tee) = pad_state.language_tees.remove(&language) {
+                let filter = pad_state.language_filters.remove(&language);
+                languages_to_remove.push((tee, filter));
+
+                gst::debug!(CAT, imp = self, "language {language} will be removed");
+            }
+        }
+
+        Ok((languages_to_remove, languages_to_add))
+    }
+
+    fn remove_caption_channels(
+        &self,
+        pad_transcription_bin: &gst::Bin,
+        ccmux: &gst::Element,
+        mut channels_to_remove: Vec<CaptionChannel>,
+    ) -> Result<(), Error> {
+        for channel in channels_to_remove.drain(..) {
+            self.tear_down_caption_channel(channel, pad_transcription_bin, ccmux)?;
+        }
+
+        Ok(())
+    }
+
+    fn remove_custom_output_channels(
+        &self,
+        pad_transcription_bin: &gst::Bin,
+        transcription_bin: &gst::Bin,
+        internal_bin: &gst::Bin,
+        serial: Option<u32>,
+        mut channels_to_remove: Vec<CustomOutputChannel>,
+    ) -> Result<(), Error> {
+        for channel in channels_to_remove.drain(..) {
+            self.tear_down_custom_output_channel(
+                channel,
+                pad_transcription_bin,
+                transcription_bin,
+                internal_bin,
+                serial,
+            )?;
+        }
+
+        Ok(())
+    }
+
+    fn remove_languages(
+        &self,
+        pad_transcription_bin: &gst::Bin,
+        mut languages_to_remove: Vec<(gst::Element, Option<gst::Element>)>,
+    ) {
+        for (tee, filter) in languages_to_remove.drain(..) {
+            let sinkpad = if let Some(ref filter) = filter {
+                filter.static_pad("sink").unwrap()
+            } else {
+                tee.static_pad("sink").unwrap()
+            };
+
+            if let Some(srcpad) = sinkpad.peer() {
+                let _ = srcpad.unlink(&sinkpad);
+
+                if srcpad.name() != "src" {
+                    srcpad
+                        .parent()
+                        .unwrap()
+                        .downcast::<gst::Element>()
+                        .unwrap()
+                        .release_request_pad(&srcpad);
+                }
+            }
+
+            let _ = pad_transcription_bin.remove(&tee);
+            let _ = tee.set_state(gst::State::Null);
+            if let Some(filter) = filter {
+                let _ = pad_transcription_bin.remove(&filter);
+                let _ = filter.set_state(gst::State::Null);
+            }
+        }
+    }
+
+    fn add_languages(
+        &self,
+        transcriber: &gst::Element,
+        pad_transcription_bin: &gst::Bin,
+        mut languages_to_add: HashMap<String, (gst::Element, Option<gst::Element>)>,
+    ) -> Result<(), Error> {
+        for (language, (tee, filter)) in languages_to_add.drain() {
+            let transcriber_srcpad = match language.as_str() {
+                "transcript" => transcriber
+                    .static_pad("src")
+                    .ok_or(anyhow!("Failed to retrieve transcription source pad"))?,
+                language => {
+                    let pad = transcriber
+                        .request_pad_simple("translate_src_%u")
+                        .ok_or(anyhow!("Failed to request translation source pad"))?;
+                    pad.set_property("language-code", language);
+                    pad
+                }
+            };
+
+            pad_transcription_bin.add(&tee)?;
+            tee.sync_state_with_parent()?;
+
+            if let Some(filter) = filter {
+                pad_transcription_bin.add(&filter)?;
+                filter.link(&tee)?;
+                filter.sync_state_with_parent()?;
+                transcriber_srcpad.link(&filter.static_pad("sink").unwrap())?;
+            } else {
+                transcriber_srcpad.link(&tee.static_pad("sink").unwrap())?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn add_caption_channels(
+        &self,
+        pad_transcription_bin: &gst::Bin,
+        ccmux: &gst::Element,
+        language_tees: &HashMap<String, gst::Element>,
+        passthrough: bool,
+        mut channels_to_add: Vec<CaptionChannel>,
+    ) -> Result<(), Error> {
+        for channel in channels_to_add.drain(..) {
+            pad_transcription_bin.add(&channel.bin)?;
+
+            let srcpad =
+                gst::GhostPad::builder_with_target(&channel.bin.static_pad("src").unwrap())
+                    .unwrap()
+                    .name(format!("src_{}", channel.language))
+                    .build();
+
+            pad_transcription_bin.add_pad(&srcpad)?;
+
+            if !passthrough {
+                let sinkpad = ccmux
+                    .static_pad(&channel.ccmux_pad_name)
+                    .unwrap_or_else(|| ccmux.request_pad_simple(&channel.ccmux_pad_name).unwrap());
+
+                srcpad.link(&sinkpad)?;
+            }
+
+            channel.bin.sync_state_with_parent()?;
+
+            let tee = language_tees.get(&channel.language).unwrap();
+
+            let tee_srcpad = tee.request_pad_simple("src_%u").unwrap();
+
+            gst::debug!(CAT, obj = tee_srcpad, "Linking language tee to channel");
+
+            tee_srcpad.link(&channel.bin.static_pad("sink").unwrap())?;
+        }
+
+        Ok(())
+    }
+
+    fn expose_custom_output_pads(
+        &self,
+        pad_transcription_bin: &gst::Bin,
+        transcription_bin: &gst::Bin,
+        internal_bin: &gst::Bin,
+        serial: Option<u32>,
+        channel: &CustomOutputChannel,
+    ) -> Result<(), Error> {
+        let mut pad_name = format!("src_{}_{}", channel.suffix, channel.language);
+        let srcpad = gst::GhostPad::builder_with_target(&channel.bin.static_pad("src").unwrap())
+            .unwrap()
+            .name(&pad_name)
+            .build();
+
+        pad_transcription_bin.add_pad(&srcpad)?;
+
+        if let Some(serial) = serial {
+            pad_name = format!("{}_{}", pad_name, serial);
+        }
+
+        let srcpad = gst::GhostPad::builder_with_target(&srcpad)
+            .unwrap()
+            .name(pad_name.clone())
+            .build();
+        transcription_bin.add_pad(&srcpad)?;
+
+        let srcpad = gst::GhostPad::with_target(&srcpad).unwrap();
+        internal_bin.add_pad(&srcpad)?;
+
+        let srcpad = gst::GhostPad::with_target(&srcpad).unwrap();
+        self.obj().add_pad(&srcpad)?;
+
+        Ok(())
+    }
+
+    fn add_custom_output_channels(
+        &self,
+        pad_transcription_bin: &gst::Bin,
+        transcription_bin: &gst::Bin,
+        internal_bin: &gst::Bin,
+        serial: Option<u32>,
+        language_tees: &HashMap<String, gst::Element>,
+        mut channels_to_add: Vec<CustomOutputChannel>,
+    ) -> Result<(), Error> {
+        for channel in channels_to_add.drain(..) {
+            pad_transcription_bin.add(&channel.bin)?;
+
+            self.expose_custom_output_pads(
+                pad_transcription_bin,
+                transcription_bin,
+                internal_bin,
+                serial,
+                &channel,
+            )?;
+
+            channel.bin.sync_state_with_parent()?;
+
+            let tee = language_tees.get(&channel.language).unwrap();
+
+            let tee_srcpad = tee.request_pad_simple("src_%u").unwrap();
+
+            gst::debug!(CAT, obj = tee_srcpad, "Linking language tee to channel");
+
+            tee_srcpad.link(&channel.bin.static_pad("sink").unwrap())?;
+        }
+
+        Ok(())
+    }
+
+    fn reconfigure_transcription_bin_dynamic(&self, pad: &TranscriberSinkPad) -> Result<(), Error> {
+        let mut s = self.state.lock().unwrap();
+        let settings = self.settings.lock().unwrap();
+
+        gst::info!(CAT, imp = self, "Reconfiguring transcription bin");
+
+        if let Some(ref mut state) = s.as_mut() {
+            let mut ps = pad.state.lock().unwrap();
+            let pad_state = ps.as_mut().unwrap();
+            let pad_settings = pad.settings.lock().unwrap();
+
+            let old_languages: HashSet<String> = pad_state
+                .caption_channels
+                .keys()
+                .chain(pad_state.synthesis_channels.keys())
+                .chain(pad_state.subtitle_channels.keys())
+                .cloned()
+                .collect();
+
+            gst::debug!(CAT, imp = self, "old languages: {old_languages:?}");
+
+            let (caption_channels_to_remove, caption_channels_to_add) =
+                self.prepare_caption_channel_updates(state, pad_state, &pad_settings)?;
+
+            let (synthesis_channels_to_remove, synthesis_channels_to_add) = self
+                .prepare_custom_output_channel_updates(
+                    &settings,
+                    &pad_settings.synthesis_languages,
+                    &mut pad_state.synthesis_channels,
+                    "synthesis",
+                )?;
+
+            let (subtitle_channels_to_remove, subtitle_channels_to_add) = self
+                .prepare_custom_output_channel_updates(
+                    &settings,
+                    &pad_settings.subtitle_languages,
+                    &mut pad_state.subtitle_channels,
+                    "subtitle",
+                )?;
+
+            let (languages_to_remove, languages_to_add) =
+                self.prepare_language_updates(pad_state, &pad_settings, old_languages)?;
+
+            let ccmux = state.ccmux.clone();
+            let pad_transcription_bin = pad_state.transcription_bin.clone();
+            let transcriber = pad_state.transcriber.clone().unwrap();
+            let language_tees = pad_state.language_tees.clone();
+            let passthrough = pad_settings.passthrough;
+            let serial = pad_state.serial;
+            let transcription_bin = state.transcription_bin.clone();
+            let internal_bin = state.internal_bin.clone();
+
+            drop(s);
+            drop(settings);
+            drop(pad_settings);
+            drop(ps);
+
+            gst::debug!(
+                CAT,
+                imp = self,
+                "update prepared, releasing locks and applying"
+            );
+
+            self.remove_caption_channels(
+                &pad_transcription_bin,
+                &ccmux,
+                caption_channels_to_remove,
+            )?;
+
+            self.remove_custom_output_channels(
+                &pad_transcription_bin,
+                &transcription_bin,
+                &internal_bin,
+                serial,
+                [synthesis_channels_to_remove, subtitle_channels_to_remove].concat(),
+            )?;
+
+            self.remove_languages(&pad_transcription_bin, languages_to_remove);
+
+            self.add_languages(&transcriber, &pad_transcription_bin, languages_to_add)?;
+
+            self.add_caption_channels(
+                &pad_transcription_bin,
+                &ccmux,
+                &language_tees,
+                passthrough,
+                caption_channels_to_add,
+            )?;
+
+            self.add_custom_output_channels(
+                &pad_transcription_bin,
+                &transcription_bin,
+                &internal_bin,
+                serial,
+                &language_tees,
+                [synthesis_channels_to_add, subtitle_channels_to_add].concat(),
+            )?;
+        }
+
         Ok(())
     }
 
@@ -936,10 +2070,12 @@ impl TranscriberBin {
                 .static_pad(&pad.obj().name())
                 .unwrap();
             let peer = sinkpad.peer();
+            let mut relink_tee = false;
             if let Some(peer) = &peer {
                 gst::debug!(CAT, imp = self, "Unlinking {:?}", peer);
                 peer.unlink(&sinkpad)?;
                 pad_state.audio_tee.release_request_pad(peer);
+                relink_tee = true;
             }
 
             pad_state.transcription_bin.set_locked_state(true);
@@ -975,80 +2111,40 @@ impl TranscriberBin {
                 return Ok(());
             }
 
-            for channel in pad_state.transcription_channels.values() {
-                let sinkpad = channel.bin.static_pad("sink").unwrap();
-                if let Some(peer) = sinkpad.peer() {
-                    peer.unlink(&sinkpad)?;
-                    if channel.language != "transcript" {
-                        if let Some(ref transcriber) = pad_state.transcriber {
-                            transcriber.release_request_pad(&peer);
-                        }
-                    }
-                }
+            self.tear_down_channels(state, pad_state)?;
 
-                let srcpad = channel.bin.static_pad("src").unwrap();
-                if let Some(peer) = srcpad.peer() {
-                    // The source pad might not have been linked to the muxer initially, for
-                    // instance in case of a collision with another source pad's
-                    // translation-languages mapping
-                    if peer.parent().and_downcast_ref::<gst::Element>()
-                        == Some(state.ccmux.as_ref())
-                    {
-                        srcpad.unlink(&peer)?;
-                        state.ccmux.release_request_pad(&peer);
-                    }
-                }
-
-                pad_state.transcription_bin.remove(&channel.bin)?;
-            }
-
-            pad_state.transcription_channels.clear();
-
-            self.construct_transcription_channels(
-                &pad_settings,
+            self.construct_channels(
+                settings.accumulate_time,
                 state.mux_method,
-                &mut pad_state.transcription_channels,
+                pad_state,
+                &pad_settings,
             )?;
 
-            for channel in pad_state.transcription_channels.values() {
-                pad_state.transcription_bin.add(&channel.bin)?;
+            self.link_transcriber_to_channels(state, pad_state)?;
 
-                if let Some(ref transcriber) = pad_state.transcriber {
-                    channel.link_transcriber(transcriber)?;
-                }
+            self.expose_channel_outputs(state, pad_state, &pad_settings)?;
 
-                let srcpad = pad_state
-                    .transcription_bin
-                    .static_pad(&format!("src_{}", channel.language))
-                    .unwrap();
-
-                srcpad
-                    .downcast_ref::<gst::GhostPad>()
-                    .unwrap()
-                    .set_target(channel.bin.static_pad("src").as_ref())?;
-
-                if state.ccmux.static_pad(&channel.ccmux_pad_name).is_none() {
-                    let ccmux_pad = state
-                        .ccmux
-                        .request_pad_simple(&channel.ccmux_pad_name)
-                        .ok_or(anyhow!("Failed to request ccmux sink pad"))?;
-                    srcpad.link(&ccmux_pad)?;
-                }
-            }
-
-            self.setup_cc_mode(&pad.obj(), pad_state, state.mux_method, pad_settings.mode);
+            self.setup_cc_mode(
+                &pad.obj(),
+                pad_state,
+                state.mux_method,
+                pad_settings.mode,
+                settings.accumulate_time,
+            );
 
             if !pad_settings.passthrough {
                 gst::debug!(CAT, imp = self, "Syncing state with parent");
-
-                let audio_tee_pad = pad_state.audio_tee.request_pad_simple("src_%u").unwrap();
 
                 drop(pad_settings);
                 drop(settings);
 
                 pad_state.transcription_bin.set_locked_state(false);
                 pad_state.transcription_bin.sync_state_with_parent()?;
-                audio_tee_pad.link(&sinkpad)?;
+                if relink_tee {
+                    let audio_tee_pad = pad_state.audio_tee.request_pad_simple("src_%u").unwrap();
+
+                    audio_tee_pad.link(&sinkpad)?;
+                }
             }
         }
 
@@ -1107,39 +2203,91 @@ impl TranscriberBin {
         );
     }
 
-    fn any_sink_is_translating(&self, state: &State) -> bool {
+    fn query_upstream_latency(&self, state: &State) -> gst::ClockTime {
+        let mut min = gst::ClockTime::from_seconds(0);
+
+        for pad in state
+            .audio_sink_pads
+            .values()
+            .map(|p| p.upcast_ref::<gst::Pad>())
+            .chain(
+                [&self.video_sinkpad]
+                    .iter()
+                    .map(|p| p.upcast_ref::<gst::Pad>()),
+            )
+        {
+            let mut upstream_query = gst::query::Latency::new();
+
+            if pad.query(&mut upstream_query) {
+                let (_, upstream_min, _) = upstream_query.result();
+
+                if min < upstream_min {
+                    min = upstream_min;
+                }
+            }
+        }
+
+        min
+    }
+
+    fn synthesis_latency(&self, state: &State) -> gst::ClockTime {
+        let mut ret = gst::ClockTime::ZERO;
+
         for pad in state.audio_sink_pads.values() {
             let ps = pad.imp().state.lock().unwrap();
-            let pad_state = ps.as_ref().unwrap();
-            if pad_state
-                .transcription_channels
-                .values()
-                .any(|c| c.language != "transcript")
-            {
-                return true;
+
+            if let Ok(pad_state) = ps.as_ref() {
+                for channel in pad_state.synthesis_channels.values() {
+                    if channel.latency > ret {
+                        ret = channel.latency;
+                    }
+                }
             }
         }
-        false
+
+        ret
     }
 
-    fn any_sink_is_rollup(&self, state: &State) -> bool {
+    fn subtitle_latency(&self, state: &State) -> gst::ClockTime {
+        let mut ret = gst::ClockTime::ZERO;
+
         for pad in state.audio_sink_pads.values() {
-            let pad_settings = pad.imp().settings.lock().unwrap();
-            if pad_settings.mode.is_rollup() {
-                return true;
+            let ps = pad.imp().state.lock().unwrap();
+
+            if let Ok(pad_state) = ps.as_ref() {
+                for channel in pad_state.subtitle_channels.values() {
+                    if channel.latency > ret {
+                        ret = channel.latency;
+                    }
+                }
             }
         }
-        false
+
+        ret
     }
 
-    fn all_sinks_are_passthrough(&self, state: &State) -> bool {
-        for pad in state.audio_sink_pads.values() {
-            let pad_settings = pad.imp().settings.lock().unwrap();
-            if !pad_settings.passthrough {
-                return false;
-            }
-        }
-        true
+    fn our_latency(&self, state: &State, settings: &Settings) -> gst::ClockTime {
+        [
+            settings.latency + self.subtitle_latency(state),
+            settings.latency + settings.accumulate_time + self.synthesis_latency(state),
+            settings.latency
+                + settings.accumulate_time
+                + CEAX08MUX_LATENCY
+                + settings.translate_latency
+                + CCCOMBINER_LATENCY
+                + state
+                    .framerate
+                    .map(|f| {
+                        2 * gst::ClockTime::SECOND
+                            .mul_div_floor(f.denom() as u64, f.numer() as u64)
+                            .unwrap()
+                    })
+                    .unwrap_or(gst::ClockTime::from_seconds(0)),
+        ]
+        .iter()
+        .max()
+        .unwrap()
+        .to_owned()
     }
 
     #[allow(clippy::single_match)]
@@ -1150,49 +2298,18 @@ impl TranscriberBin {
 
         match query.view_mut() {
             QueryViewMut::Latency(q) => {
-                let mut upstream_query = gst::query::Latency::new();
+                let state = self.state.lock().unwrap();
+                if let Some(state) = state.as_ref() {
+                    let upstream_min = self.query_upstream_latency(state);
+                    let min =
+                        upstream_min + self.our_latency(state, &self.settings.lock().unwrap());
 
-                let ret = gst::Pad::query_default(pad, Some(&*self.obj()), &mut upstream_query);
-
-                if ret {
-                    let (_, mut min, _) = upstream_query.result();
-                    let state = self.state.lock().unwrap();
-                    let (received_framerate, translating, all_passthrough) = {
-                        if let Some(state) = state.as_ref() {
-                            (
-                                state.framerate,
-                                self.any_sink_is_translating(state),
-                                self.all_sinks_are_passthrough(state),
-                            )
-                        } else {
-                            (None, false, true)
-                        }
-                    };
-
-                    let settings = self.settings.lock().unwrap();
-                    if all_passthrough || received_framerate.is_none() {
-                        min += settings.latency + settings.accumulate_time + CEAX08MUX_LATENCY;
-
-                        if translating {
-                            min += settings.translate_latency;
-                        }
-
-                        /* The sub latency introduced by ceax08mux */
-                        if let Some(framerate) = received_framerate {
-                            min += gst::ClockTime::SECOND
-                                .mul_div_floor(framerate.denom() as u64, framerate.numer() as u64)
-                                .unwrap();
-                        }
-                    } else if let Some(state) = state.as_ref() {
-                        if self.any_sink_is_rollup(state) {
-                            min += settings.accumulate_time;
-                        }
-                    }
+                    gst::debug!(CAT, imp = self, "calculated latency: {}", min);
 
                     q.set(true, min, gst::ClockTime::NONE);
                 }
 
-                ret
+                true
             }
             _ => gst::Pad::query_default(pad, Some(&*self.obj()), query),
         }
@@ -1218,7 +2335,7 @@ impl TranscriberBin {
                 .and_then(|f| f.load().ok())
                 .map(|f| f.element_type())
                 .and_then(glib::Class::<gst::Element>::from_type)
-                .map(|k| k.has_property("force-live", Some(bool::static_type())))
+                .map(|k| k.has_property_with_type("force-live", bool::static_type()))
                 .unwrap_or(false)
         };
 
@@ -1246,10 +2363,11 @@ impl TranscriberBin {
             .as_mut()
             .map_err(|err| anyhow!("Sink pad state creation failed: {err}"))?;
         let pad_settings = pad.imp().settings.lock().unwrap();
-        self.construct_transcription_channels(
-            &pad_settings,
+        self.construct_channels(
+            settings.accumulate_time,
             settings.mux_method,
-            &mut pad_state.transcription_channels,
+            pad_state,
+            &pad_settings,
         )?;
 
         Ok(State {
@@ -1412,19 +2530,9 @@ impl ObjectImpl for TranscriberBin {
                     .default_value(DEFAULT_ACCUMULATE.mseconds() as u32)
                     .mutable_ready()
                     .build(),
-                glib::ParamSpecEnum::builder_with_default("mode", DEFAULT_MODE)
-                    .nick("Mode")
-                    .blurb("Which closed caption mode to operate in")
-                    .mutable_playing()
-                    .build(),
                 glib::ParamSpecBoxed::builder::<gst::Caps>("cc-caps")
                     .nick("Closed Caption caps")
                     .blurb("The expected format of the closed captions")
-                    .mutable_ready()
-                    .build(),
-                glib::ParamSpecObject::builder::<gst::Element>("transcriber")
-                    .nick("Transcriber")
-                    .blurb("The transcriber element to use")
                     .mutable_ready()
                     .build(),
                 glib::ParamSpecEnum::builder_with_default("caption-source", DEFAULT_CAPTION_SOURCE)
@@ -1434,23 +2542,11 @@ impl ObjectImpl for TranscriberBin {
                     of the other source will be dropped by transcriberbin")
                     .mutable_playing()
                     .build(),
-                glib::ParamSpecBoxed::builder::<gst::Structure>("translation-languages")
-                    .nick("Translation languages")
-                    .blurb("A map of language codes to caption channels, e.g. translation-languages=\"languages, transcript={CC1, 708_1}, fr={708_2, CC3}\" will map the French translation to CC1/service 1 and the original transcript to CC3/service 2")
-                    .construct()
-                    .mutable_playing()
-                    .build(),
                 glib::ParamSpecUInt::builder("translate-latency")
                     .nick("Translation Latency")
                     .blurb("Amount of extra milliseconds to allow for translating")
                     .default_value(DEFAULT_TRANSLATE_LATENCY.mseconds() as u32)
                     .mutable_ready()
-                    .build(),
-                glib::ParamSpecString::builder("language-code")
-                    .nick("Language Code")
-                    .blurb("The language of the input stream")
-                    .default_value(Some(DEFAULT_INPUT_LANG_CODE))
-                    .mutable_playing()
                     .build(),
                 glib::ParamSpecEnum::builder("mux-method")
                     .nick("Mux Method")
@@ -1467,16 +2563,53 @@ impl ObjectImpl for TranscriberBin {
     fn set_property(&self, _id: usize, value: &glib::Value, pspec: &glib::ParamSpec) {
         match pspec.name() {
             "latency" => {
+                let state = self.state.lock().unwrap();
                 let mut settings = self.settings.lock().unwrap();
                 settings.latency = gst::ClockTime::from_mseconds(
                     value.get::<u32>().expect("type checked upstream").into(),
                 );
+
+                if let Some(state) = state.as_ref() {
+                    for pad in state.audio_sink_pads.values() {
+                        let ps = pad.imp().state.lock().unwrap();
+                        let pad_state = ps.as_ref().unwrap();
+
+                        if let Some(ref transcriber) = pad_state.transcriber {
+                            let latency_ms = settings.latency.mseconds() as u32;
+
+                            if transcriber
+                                .has_property_with_type("transcribe-latency", u32::static_type())
+                            {
+                                transcriber.set_property("transcribe-latency", latency_ms);
+                            } else if transcriber
+                                .has_property_with_type("latency", u32::static_type())
+                            {
+                                transcriber.set_property("latency", latency_ms);
+                            }
+                        }
+                    }
+                }
             }
             "lateness" => {
+                let state = self.state.lock().unwrap();
                 let mut settings = self.settings.lock().unwrap();
                 settings.lateness = gst::ClockTime::from_mseconds(
                     value.get::<u32>().expect("type checked upstream").into(),
                 );
+
+                if let Some(state) = state.as_ref() {
+                    for pad in state.audio_sink_pads.values() {
+                        let ps = pad.imp().state.lock().unwrap();
+                        let pad_state = ps.as_ref().unwrap();
+
+                        if let Some(ref transcriber) = pad_state.transcriber {
+                            if transcriber.has_property_with_type("lateness", u32::static_type()) {
+                                let lateness_ms = settings.lateness.mseconds() as u32;
+                                transcriber.set_property("lateness", lateness_ms);
+                            }
+                        }
+                    }
+                }
             }
             "accumulate-time" => {
                 let mut settings = self.settings.lock().unwrap();
@@ -1494,19 +2627,31 @@ impl ObjectImpl for TranscriberBin {
                 let mut settings = self.settings.lock().unwrap();
                 settings.cc_caps = value.get().expect("type checked upstream");
             }
-            "transcriber" => {
-                self.audio_sinkpad.set_property(
-                    "transcriber",
-                    value.get::<gst::Element>().expect("type checked upstream"),
-                );
-            }
             "caption-source" => {
                 let mut settings = self.settings.lock().unwrap();
                 settings.caption_source = value.get().expect("type checked upstream");
 
                 let s = self.state.lock().unwrap();
                 if let Some(state) = s.as_ref() {
-                    if settings.caption_source == CaptionSource::Inband {
+                    if state.cccombiner.has_property("input-meta-processing") {
+                        match settings.caption_source {
+                            CaptionSource::Inband => {
+                                state
+                                    .cccombiner
+                                    .set_property_from_str("input-meta-processing", "force");
+                            }
+                            CaptionSource::Both => {
+                                state
+                                    .cccombiner
+                                    .set_property_from_str("input-meta-processing", "append");
+                            }
+                            CaptionSource::Transcription => {
+                                state
+                                    .cccombiner
+                                    .set_property_from_str("input-meta-processing", "drop");
+                            }
+                        }
+                    } else if settings.caption_source == CaptionSource::Inband {
                         gst::debug!(
                             CAT,
                             imp = self,
@@ -1519,27 +2664,28 @@ impl ObjectImpl for TranscriberBin {
                     }
                 }
             }
-            "translation-languages" => {
-                self.audio_sinkpad.set_property(
-                    "translation-languages",
-                    value
-                        .get::<Option<gst::Structure>>()
-                        .expect("type checked upstream"),
-                );
-            }
             "translate-latency" => {
+                let state = self.state.lock().unwrap();
                 let mut settings = self.settings.lock().unwrap();
                 settings.translate_latency = gst::ClockTime::from_mseconds(
                     value.get::<u32>().expect("type checked upstream").into(),
                 );
-            }
-            "language-code" => {
-                self.audio_sinkpad.set_property(
-                    "language-code",
-                    value
-                        .get::<Option<String>>()
-                        .expect("type checked upstream"),
-                );
+                if let Some(state) = state.as_ref() {
+                    for pad in state.audio_sink_pads.values() {
+                        let ps = pad.imp().state.lock().unwrap();
+                        let pad_state = ps.as_ref().unwrap();
+
+                        if let Some(ref transcriber) = pad_state.transcriber {
+                            if transcriber
+                                .has_property_with_type("translate-latency", u32::static_type())
+                            {
+                                let translate_latency_ms =
+                                    settings.translate_latency.mseconds() as u32;
+                                transcriber.set_property("translate-latency", translate_latency_ms);
+                            }
+                        }
+                    }
+                }
             }
             "mux-method" => {
                 let mut settings = self.settings.lock().unwrap();
@@ -1563,22 +2709,18 @@ impl ObjectImpl for TranscriberBin {
                 let settings = self.settings.lock().unwrap();
                 (settings.accumulate_time.mseconds() as u32).to_value()
             }
-            "mode" => self.audio_sinkpad.property("mode"),
             "cc-caps" => {
                 let settings = self.settings.lock().unwrap();
                 settings.cc_caps.to_value()
             }
-            "transcriber" => self.audio_sinkpad.property("transcriber"),
             "caption-source" => {
                 let settings = self.settings.lock().unwrap();
                 settings.caption_source.to_value()
             }
-            "translation-languages" => self.audio_sinkpad.property("translation-languages"),
             "translate-latency" => {
                 let settings = self.settings.lock().unwrap();
                 (settings.translate_latency.mseconds() as u32).to_value()
             }
-            "language-code" => self.audio_sinkpad.property("language-code"),
             "mux-method" => {
                 let settings = self.settings.lock().unwrap();
                 settings.mux_method.to_value()
@@ -1679,6 +2821,68 @@ impl ElementImpl for TranscriberBin {
             )
             .unwrap();
 
+            let src_caps = gst::Caps::builder("application/x-json").build();
+            let unsynced_src_pad_template = gst::PadTemplate::new(
+                "unsynced_src",
+                gst::PadDirection::Src,
+                gst::PadPresence::Sometimes,
+                &src_caps,
+            )
+            .unwrap();
+            let unsynced_translate_src_pad_template = gst::PadTemplate::new(
+                "unsynced_translate_src_%u",
+                gst::PadDirection::Src,
+                gst::PadPresence::Sometimes,
+                &src_caps,
+            )
+            .unwrap();
+            let unsynced_secondary_src_pad_template = gst::PadTemplate::new(
+                "unsynced_src_%u",
+                gst::PadDirection::Src,
+                gst::PadPresence::Sometimes,
+                &src_caps,
+            )
+            .unwrap();
+            let unsynced_secondary_translate_src_pad_template = gst::PadTemplate::new(
+                "unsynced_translate_src_%u_%u",
+                gst::PadDirection::Src,
+                gst::PadPresence::Sometimes,
+                &src_caps,
+            )
+            .unwrap();
+
+            let src_caps = gst::Caps::builder("text/x-raw").build();
+            let subtitle_src_pad_template = gst::PadTemplate::new(
+                "src_subtitle_%s",
+                gst::PadDirection::Src,
+                gst::PadPresence::Sometimes,
+                &src_caps,
+            )
+            .unwrap();
+            let secondary_subtitle_src_pad_template = gst::PadTemplate::new(
+                "src_subtitle_%s_%u",
+                gst::PadDirection::Src,
+                gst::PadPresence::Sometimes,
+                &src_caps,
+            )
+            .unwrap();
+
+            let src_caps = gst::Caps::builder("audio/x-raw").build();
+            let synthesis_src_pad_template = gst::PadTemplate::new(
+                "src_synthesis_%s",
+                gst::PadDirection::Src,
+                gst::PadPresence::Sometimes,
+                &src_caps,
+            )
+            .unwrap();
+            let secondary_synthesis_src_pad_template = gst::PadTemplate::new(
+                "src_synthesis_%s_%u",
+                gst::PadDirection::Src,
+                gst::PadPresence::Sometimes,
+                &src_caps,
+            )
+            .unwrap();
+
             vec![
                 video_src_pad_template,
                 video_sink_pad_template,
@@ -1686,6 +2890,14 @@ impl ElementImpl for TranscriberBin {
                 audio_sink_pad_template,
                 secondary_audio_sink_pad_template,
                 secondary_audio_src_pad_template,
+                unsynced_src_pad_template,
+                unsynced_translate_src_pad_template,
+                unsynced_secondary_src_pad_template,
+                unsynced_secondary_translate_src_pad_template,
+                subtitle_src_pad_template,
+                secondary_subtitle_src_pad_template,
+                synthesis_src_pad_template,
+                secondary_synthesis_src_pad_template,
             ]
         });
 
@@ -1718,7 +2930,7 @@ impl ElementImpl for TranscriberBin {
         let _ = pad_state.transcription_bin.set_state(gst::State::Null);
 
         if let Some(ref mut state) = s.as_mut() {
-            for channel in pad_state.transcription_channels.values() {
+            for channel in pad_state.caption_channels.values() {
                 if let Some(srcpad) = pad_state
                     .transcription_bin
                     .static_pad(&format!("src_{}", channel.language))
@@ -1800,14 +3012,18 @@ impl ElementImpl for TranscriberBin {
                     }
                 };
                 let pad_settings = sink_pad.imp().settings.lock().unwrap();
-                self.construct_transcription_channels(
-                    &pad_settings,
+                self.construct_channels(
+                    settings.accumulate_time,
                     settings.mux_method,
-                    &mut pad_state.transcription_channels,
+                    pad_state,
+                    &pad_settings,
                 )
                 .unwrap();
 
-                if let Err(e) = self.link_input_audio_stream(&name, pad_state, state) {
+                pad_state.serial = Some(state.audio_serial);
+
+                if let Err(e) = self.link_input_audio_stream(&name, pad_state, state, &pad_settings)
+                {
                     gst::error!(CAT, "Failed to link secondary audio stream: {e}");
                     return None;
                 }
@@ -1959,6 +3175,9 @@ impl BinImpl for TranscriberBin {
 #[derive(Debug, Clone)]
 struct TranscriberSinkPadSettings {
     translation_languages: Option<gst::Structure>,
+    synthesis_languages: Option<gst::Structure>,
+    subtitle_languages: Option<gst::Structure>,
+    language_filters: Option<gst::Structure>,
     language_code: String,
     mode: Cea608Mode,
     passthrough: bool,
@@ -1968,6 +3187,9 @@ impl Default for TranscriberSinkPadSettings {
     fn default() -> Self {
         Self {
             translation_languages: None,
+            synthesis_languages: None,
+            subtitle_languages: None,
+            language_filters: None,
             language_code: String::from(DEFAULT_INPUT_LANG_CODE),
             mode: DEFAULT_MODE,
             passthrough: DEFAULT_PASSTHROUGH,
@@ -1984,9 +3206,29 @@ struct TranscriberSinkPadState {
     transcriber_resample: gst::Element,
     transcriber: Option<gst::Element>,
     queue_passthrough: gst::Element,
-    transcription_channels: HashMap<String, TranscriptionChannel>,
+    caption_channels: HashMap<String, CaptionChannel>,
+    synthesis_channels: HashMap<String, CustomOutputChannel>,
+    subtitle_channels: HashMap<String, CustomOutputChannel>,
     srcpad_name: Option<String>,
+    passthrough_state: PassthroughState,
     target_passthrough_state: TargetPassthroughState,
+    serial: Option<u32>,
+    language_tees: HashMap<String, gst::Element>,
+    language_filters: HashMap<String, gst::Element>,
+}
+
+impl TranscriberSinkPad {
+    fn uses_translation_bin(&self) -> bool {
+        let s = self.state.lock().unwrap();
+        let state = s.as_ref().unwrap();
+
+        state
+            .transcriber
+            .as_ref()
+            .and_then(|t| t.factory())
+            .map(|f| f.name() == "translationbin")
+            .unwrap_or(false)
+    }
 }
 
 impl TranscriberSinkPadState {
@@ -2012,10 +3254,168 @@ impl TranscriberSinkPadState {
                 .build()
                 .ok(),
             queue_passthrough: gst::ElementFactory::make("queue").build()?,
-            transcription_channels: HashMap::new(),
+            caption_channels: HashMap::new(),
+            synthesis_channels: HashMap::new(),
+            subtitle_channels: HashMap::new(),
             srcpad_name: None,
+            passthrough_state: PassthroughState::Disabled,
             target_passthrough_state: TargetPassthroughState::None,
+            serial: None,
+            language_tees: HashMap::new(),
+            language_filters: HashMap::new(),
         })
+    }
+
+    fn remove_unsynced_pads(
+        &self,
+        topbin: &super::TranscriberBin,
+        state: &State,
+        srcpad_name: &str,
+    ) {
+        let Some(ref transcriber) = self.transcriber else {
+            return;
+        };
+
+        let mut unsynced_pad_name = format!("unsynced_{}", srcpad_name);
+
+        if transcriber.static_pad(&unsynced_pad_name).is_some() {
+            let srcpad = self
+                .transcription_bin
+                .static_pad(&unsynced_pad_name)
+                .unwrap();
+            let _ = self.transcription_bin.remove_pad(&srcpad);
+            if let Some(serial) = self.serial {
+                unsynced_pad_name = format!("{}_{}", unsynced_pad_name, serial);
+            }
+            let srcpad = state
+                .transcription_bin
+                .static_pad(&unsynced_pad_name)
+                .unwrap();
+            let _ = state.transcription_bin.remove_pad(&srcpad);
+
+            let srcpad = state.internal_bin.static_pad(&unsynced_pad_name).unwrap();
+            let _ = state.internal_bin.remove_pad(&srcpad);
+            let srcpad = topbin.static_pad(&unsynced_pad_name).unwrap();
+            let _ = topbin.remove_pad(&srcpad);
+        }
+    }
+
+    fn unlink_language_tees(
+        &self,
+        topbin: &super::TranscriberBin,
+        state: &State,
+        pad_state: &TranscriberSinkPadState,
+    ) {
+        for (language, tee) in pad_state.language_tees.iter() {
+            let sinkpad = if let Some(filter) = pad_state.language_filters.get(language) {
+                filter.static_pad("sink").unwrap()
+            } else {
+                tee.static_pad("sink").unwrap()
+            };
+
+            if let Some(srcpad) = sinkpad.peer() {
+                let _ = srcpad.unlink(&sinkpad);
+                self.remove_unsynced_pads(topbin, state, srcpad.name().as_str());
+                if srcpad.name() != "src" {
+                    srcpad
+                        .parent()
+                        .unwrap()
+                        .downcast::<gst::Element>()
+                        .unwrap()
+                        .release_request_pad(&srcpad);
+                }
+            }
+
+            for srcpad in tee.iterate_src_pads() {
+                let Ok(srcpad) = srcpad else {
+                    continue;
+                };
+
+                if let Some(sinkpad) = srcpad.peer() {
+                    let _ = srcpad.unlink(&sinkpad);
+                }
+            }
+        }
+    }
+
+    fn expose_unsynced_pads(
+        &self,
+        topbin: &super::TranscriberBin,
+        state: &State,
+        srcpad_name: &str,
+    ) -> Result<(), Error> {
+        let Some(ref transcriber) = self.transcriber else {
+            return Ok(());
+        };
+
+        let mut unsynced_pad_name = format!("unsynced_{srcpad_name}");
+
+        if let Some(unsynced_pad) = transcriber.static_pad(&unsynced_pad_name) {
+            let srcpad = gst::GhostPad::builder_with_target(&unsynced_pad)
+                .unwrap()
+                .name(unsynced_pad_name.clone())
+                .build();
+            self.transcription_bin.add_pad(&srcpad)?;
+
+            if let Some(serial) = self.serial {
+                unsynced_pad_name = format!("{}_{}", unsynced_pad_name, serial);
+            }
+
+            let srcpad = gst::GhostPad::builder_with_target(&srcpad)
+                .unwrap()
+                .name(unsynced_pad_name.clone())
+                .build();
+            state.transcription_bin.add_pad(&srcpad)?;
+
+            let srcpad = gst::GhostPad::with_target(&srcpad).unwrap();
+            state.internal_bin.add_pad(&srcpad)?;
+
+            let srcpad = gst::GhostPad::with_target(&srcpad).unwrap();
+
+            srcpad.set_active(true).unwrap();
+
+            unsynced_pad.sticky_events_foreach(|event| {
+                if event.type_() == gst::EventType::Tag
+                    || event.type_() == gst::EventType::StreamStart
+                {
+                    gst::debug!(
+                        CAT,
+                        obj = srcpad,
+                        "Storing {event:?} on unsynced source pad"
+                    );
+                    let _ = srcpad.store_sticky_event(event);
+                }
+                std::ops::ControlFlow::Continue(gst::EventForeachAction::Keep)
+            });
+
+            topbin.add_pad(&srcpad)?;
+        }
+
+        Ok(())
+    }
+
+    fn link_transcription_channel(
+        &self,
+        channel: &CaptionChannel,
+        state: &State,
+        passthrough: bool,
+    ) -> Result<(), Error> {
+        let srcpad = gst::GhostPad::builder_with_target(&channel.bin.static_pad("src").unwrap())
+            .unwrap()
+            .name(format!("src_{}", channel.language))
+            .build();
+
+        self.transcription_bin.add_pad(&srcpad)?;
+
+        if state.ccmux.static_pad(&channel.ccmux_pad_name).is_none() && !passthrough {
+            let ccmux_pad = state
+                .ccmux
+                .request_pad_simple(&channel.ccmux_pad_name)
+                .ok_or(anyhow!("Failed to request ccmux sink pad"))?;
+            srcpad.link(&ccmux_pad)?;
+        }
+
+        Ok(())
     }
 }
 
@@ -2068,6 +3468,41 @@ impl ObjectImpl for TranscriberSinkPad {
                     .nick("Transcriber")
                     .blurb("The transcriber element to use")
                     .mutable_ready()
+                    .build(),
+                glib::ParamSpecBoxed::builder::<gst::Structure>("synthesis-languages")
+                    .nick("Synthesis languages")
+                    .blurb("A map of language codes to bin descriptions, e.g. synthesis-languages=\"languages, fr=awspolly\" will use the awspolly element to synthesize speech from French translations")
+                    .mutable_playing()
+                    .build(),
+                glib::ParamSpecBoxed::builder::<gst::Structure>("subtitle-languages")
+                    .nick("Subtitle languages")
+                    .blurb("A map of language codes to bin descriptions, e.g. subtitle-languages=\"languages, fr=textwrap lines=2 accumulate-time=5000000000\" will use the textwrap element before outputting the subtitles")
+                    .mutable_playing()
+                    .build(),
+                gst::ParamSpecArray::builder("transcription-mix-matrix")
+                    .nick("Transcription mix matrix")
+                    .blurb("Initial transformation matrix for the transcriber audioconvert")
+                    .element_spec(
+                        &gst::ParamSpecArray::builder("rows")
+                            .nick("Rows")
+                            .blurb("A row in the matrix")
+                            .element_spec(
+                                &glib::ParamSpecFloat::builder("columns")
+                                .nick("Columns")
+                                .blurb("A column in the matrix")
+                                .minimum(-1.)
+                                .maximum(1.)
+                                .default_value(0.)
+                                .build()
+                            )
+                            .build(),
+                    )
+                    .mutable_ready()
+                    .build(),
+                glib::ParamSpecBoxed::builder::<gst::Structure>("language-filters")
+                    .nick("Language filters")
+                    .blurb("A map of language codes to bin descriptions, e.g. text-filters=\"languages, fr=regex\" will filter words out of the transcriber through the regex element")
+                    .mutable_playing()
                     .build(),
         ]
         });
@@ -2122,10 +3557,105 @@ impl ObjectImpl for TranscriberSinkPad {
                 drop(settings);
 
                 if let Some(this) = self.obj().parent().and_downcast::<super::TranscriberBin>() {
+                    if self.uses_translation_bin() {
+                        if let Err(e) = this.imp().reconfigure_transcription_bin_dynamic(self) {
+                            gst::error!(CAT, "Couldn't reconfigure caption channels: {e}");
+                            gst::element_imp_error!(
+                                this.imp(),
+                                gst::StreamError::Failed,
+                                ["Couldn't reconfigure caption channels: {}", e]
+                            );
+                            *this.imp().state.lock().unwrap() = None;
+                        }
+                    } else {
+                        this.imp().update_languages(&self.obj(), false)
+                    }
+                }
+            }
+            "synthesis-languages" => {
+                let mut settings = self.settings.lock().unwrap();
+                settings.synthesis_languages = value
+                    .get::<Option<gst::Structure>>()
+                    .expect("type checked upstream");
+                gst::debug!(
+                    CAT,
+                    imp = self,
+                    "Updated synthesis-languages {:?}",
+                    settings.synthesis_languages
+                );
+
+                drop(settings);
+
+                if let Some(this) = self.obj().parent().and_downcast::<super::TranscriberBin>() {
+                    if self.uses_translation_bin() {
+                        if let Err(e) = this.imp().reconfigure_transcription_bin_dynamic(self) {
+                            gst::error!(CAT, "Couldn't reconfigure synthesis channels: {e}");
+                            gst::element_imp_error!(
+                                this.imp(),
+                                gst::StreamError::Failed,
+                                ["Couldn't reconfigure synthesis channels: {}", e]
+                            );
+                            *this.imp().state.lock().unwrap() = None;
+                        }
+                    } else {
+                        this.imp().update_languages(&self.obj(), false)
+                    }
+                }
+            }
+            "subtitle-languages" => {
+                let mut settings = self.settings.lock().unwrap();
+                settings.subtitle_languages = value
+                    .get::<Option<gst::Structure>>()
+                    .expect("type checked upstream");
+                gst::debug!(
+                    CAT,
+                    imp = self,
+                    "Updated subtitle-languages {:?}",
+                    settings.subtitle_languages
+                );
+
+                drop(settings);
+
+                if let Some(this) = self.obj().parent().and_downcast::<super::TranscriberBin>() {
+                    if self.uses_translation_bin() {
+                        if let Err(e) = this.imp().reconfigure_transcription_bin_dynamic(self) {
+                            gst::error!(CAT, "Couldn't reconfigure subtitle channels: {e}");
+                            gst::element_imp_error!(
+                                this.imp(),
+                                gst::StreamError::Failed,
+                                ["Couldn't reconfigure subtitle channels: {}", e]
+                            );
+                            *this.imp().state.lock().unwrap() = None;
+                        }
+                    } else {
+                        this.imp().update_languages(&self.obj(), false)
+                    }
+                }
+            }
+            "language-filters" => {
+                let mut settings = self.settings.lock().unwrap();
+                settings.language_filters = value
+                    .get::<Option<gst::Structure>>()
+                    .expect("type checked upstream");
+                gst::debug!(
+                    CAT,
+                    imp = self,
+                    "Updated language-filters {:?}",
+                    settings.language_filters
+                );
+
+                drop(settings);
+
+                if let Some(this) = self.obj().parent().and_downcast::<super::TranscriberBin>() {
                     this.imp().update_languages(&self.obj(), false);
                 }
             }
             "mode" => {
+                let Some(parent) = self.obj().parent().and_downcast::<super::TranscriberBin>()
+                else {
+                    return;
+                };
+                let accumulate_time = parent.imp().settings.lock().unwrap().accumulate_time;
                 let mut settings = self.settings.lock().unwrap();
 
                 let old_mode = settings.mode;
@@ -2144,6 +3674,7 @@ impl ObjectImpl for TranscriberSinkPad {
                                 pad_state,
                                 state.mux_method,
                                 new_mode,
+                                accumulate_time,
                             );
                         }
                     }
@@ -2172,17 +3703,22 @@ impl ObjectImpl for TranscriberSinkPad {
                 }
             }
             "transcriber" => {
-                let mut ps = self.state.lock().unwrap();
-                let Ok(pad_state) = ps.as_mut() else {
-                    return;
-                };
-                let old_transcriber = pad_state.transcriber.clone();
-                let new_transcriber: Option<gst::Element> =
-                    value.get().expect("type checked upstream");
-                pad_state.transcriber.clone_from(&new_transcriber);
-
                 if let Some(this) = self.obj().parent().and_downcast::<super::TranscriberBin>() {
+                    let new_transcriber: Option<gst::Element> =
+                        value.get().expect("type checked upstream");
+
+                    if let Some(ref transcriber) = new_transcriber {
+                        this.imp().configure_transcriber(transcriber);
+                    }
+
                     let mut s = this.imp().state.lock().unwrap();
+                    let mut ps = self.state.lock().unwrap();
+                    let Ok(pad_state) = ps.as_mut() else {
+                        return;
+                    };
+                    let old_transcriber = pad_state.transcriber.clone();
+                    pad_state.transcriber.clone_from(&new_transcriber);
+
                     if old_transcriber != new_transcriber {
                         if let Some(ref mut state) = s.as_mut() {
                             match this.imp().relink_transcriber(
@@ -2201,6 +3737,15 @@ impl ObjectImpl for TranscriberSinkPad {
                     }
                 }
             }
+            "transcription-mix-matrix" => {
+                let mut ps = self.state.lock().unwrap();
+                let Ok(pad_state) = ps.as_mut() else {
+                    return;
+                };
+                pad_state
+                    .transcriber_aconv
+                    .set_property("mix-matrix", value);
+            }
             _ => unimplemented!(),
         }
     }
@@ -2215,6 +3760,18 @@ impl ObjectImpl for TranscriberSinkPad {
                 let settings = self.settings.lock().unwrap();
                 settings.translation_languages.to_value()
             }
+            "synthesis-languages" => {
+                let settings = self.settings.lock().unwrap();
+                settings.synthesis_languages.to_value()
+            }
+            "subtitle-languages" => {
+                let settings = self.settings.lock().unwrap();
+                settings.subtitle_languages.to_value()
+            }
+            "language-filters" => {
+                let settings = self.settings.lock().unwrap();
+                settings.language_filters.to_value()
+            }
             "language-code" => {
                 let settings = self.settings.lock().unwrap();
                 settings.language_code.to_value()
@@ -2228,6 +3785,16 @@ impl ObjectImpl for TranscriberSinkPad {
                 match ps.as_ref() {
                     Ok(ps) => ps.transcriber.to_value(),
                     Err(_) => None::<gst::Element>.to_value(),
+                }
+            }
+            "transcription-mix-matrix" => {
+                let ps = self.state.lock().unwrap();
+                match ps.as_ref() {
+                    Ok(ps) => ps.transcriber_aconv.property_value("mix-matrix"),
+                    Err(_) => {
+                        let v: Vec<gst::Array> = vec![];
+                        gst::Array::new(&v).to_value()
+                    }
                 }
             }
             _ => unimplemented!(),

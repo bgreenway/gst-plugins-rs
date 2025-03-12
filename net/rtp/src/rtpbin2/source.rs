@@ -70,7 +70,7 @@ impl Rb {
     }
 }
 
-impl<'a> From<ReportBlock<'a>> for Rb {
+impl From<ReportBlock<'_>> for Rb {
     fn from(value: ReportBlock) -> Self {
         Self {
             ssrc: value.ssrc(),
@@ -923,10 +923,7 @@ impl RemoteSendSource {
     pub(crate) fn request_remote_key_unit(&mut self, _now: Instant, typ: KeyUnitRequestType) {
         match typ {
             KeyUnitRequestType::Fir(count) => {
-                if self
-                    .send_fir_count
-                    .map_or(true, |previous_count| previous_count != count)
-                {
+                if self.send_fir_count != Some(count) {
                     self.send_fir_seqnum = self.send_fir_seqnum.wrapping_add(1);
                 }
                 self.send_fir = true;

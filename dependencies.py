@@ -20,7 +20,7 @@ PARSER = ArgumentParser()
 PARSER.add_argument('src_dir', type=Path)
 PARSER.add_argument('plugins', nargs='*')
 PARSER.add_argument('--features', action="store_true", help="Get list of features to activate")
-PARSER.add_argument('--gst-version', help="Get list of features to activate")
+PARSER.add_argument('--gst-version', help="GStreamer version used")
 
 
 # Map plugin name to directory name, for those that does not match.
@@ -63,9 +63,12 @@ class CargoAnalyzer:
 
     def extract_features(self, cargo_data):
         features = cargo_data['features']
+        print(f'Available features: {features!r}', file=sys.stderr)
         wanted_features = set()
         gst_version_major = int(self.gst_version.split('.')[0])
         gst_version_minor = int(self.gst_version.split('.')[1])
+        if gst_version_minor % 2:
+            gst_version_minor += 1
         for (name, value) in features.items():
             version = self.extract_version(name)
 
@@ -75,11 +78,13 @@ class CargoAnalyzer:
 
             if gst_version_major < majver or gst_version_minor < minver:
                 continue
+            wanted_features |= set([name])
             wanted_features |= set(value)
             if name.startswith("gst"):
                 # Required for some reason for rswebrtc which has a specific feature
                 wanted_features |= {f"{cargo_data['package']['name']}/{name}"}
 
+        print(f'Enabling features: {wanted_features!r}', file=sys.stderr)
         return wanted_features
 
     def run(self):

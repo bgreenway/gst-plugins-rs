@@ -12,6 +12,7 @@ use gst_plugin_webrtc_signalling::server::{Server, ServerError};
 use gst_rtp::prelude::*;
 use gst_utils::StreamProducer;
 use gst_video::subclass::prelude::*;
+use gst_video::VideoMultiviewMode;
 use gst_webrtc::{WebRTCDataChannel, WebRTCICETransportPolicy};
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener;
@@ -324,6 +325,9 @@ struct SessionInner {
     codecs: Option<BTreeMap<i32, Codec>>,
 
     stats_collection_handle: Option<tokio::task::JoinHandle<()>>,
+
+    navigation_handler: Option<NavigationEventHandler>,
+    control_events_handler: Option<ControlRequestHandler>,
 }
 
 #[derive(Clone)]
@@ -363,8 +367,6 @@ struct State {
     video_serial: u32,
     streams: HashMap<String, InputStream>,
     discoveries: HashMap<String, Vec<DiscoveryInfo>>,
-    navigation_handler: Option<NavigationEventHandler>,
-    control_events_handler: Option<ControlRequestHandler>,
     signaller_signals: Option<SignallerSignals>,
     finalizing_sessions: Arc<(Mutex<HashSet<String>>, Condvar)>,
     #[cfg(feature = "web_server")]
@@ -493,12 +495,12 @@ struct PipelineWrapper(gst::Pipeline);
 // This is simply used to hold references to the inner items.
 #[allow(dead_code)]
 #[derive(Debug)]
-struct NavigationEventHandler((glib::SignalHandlerId, WebRTCDataChannel));
+struct NavigationEventHandler((Option<glib::SignalHandlerId>, WebRTCDataChannel));
 
 // Structure to generate arbitrary upstream events from a WebRTCDataChannel
 #[allow(dead_code)]
 #[derive(Debug)]
-struct ControlRequestHandler((glib::SignalHandlerId, WebRTCDataChannel));
+struct ControlRequestHandler((Option<glib::SignalHandlerId>, WebRTCDataChannel));
 
 /// Our instance structure
 #[derive(Default)]
@@ -566,8 +568,6 @@ impl Default for State {
             video_serial: 0,
             streams: HashMap::new(),
             discoveries: HashMap::new(),
-            navigation_handler: None,
-            control_events_handler: None,
             signaller_signals: Default::default(),
             finalizing_sessions: Arc::new((Mutex::new(HashSet::new()), Condvar::new())),
             #[cfg(feature = "web_server")]
@@ -758,7 +758,15 @@ fn configure_encoder(enc: &gst::Element, start_bitrate: u32) {
                 enc.set_property("b-adapt", false);
                 enc.set_property("vbv-buf-capacity", 120u32);
             }
-            "nvh264enc" => {
+            "openh264enc" => {
+                enc.set_property("bitrate", start_bitrate);
+                enc.set_property("gop-size", 2560u32);
+                enc.set_property_from_str("rate-control", "bitrate");
+                enc.set_property_from_str("complexity", "low");
+                enc.set_property("background-detection", false);
+                enc.set_property("scene-change-detection", false);
+            }
+            "nvh264enc" | "nvh265enc" => {
                 enc.set_property("bitrate", start_bitrate / 1000);
                 enc.set_property("gop-size", 2560i32);
                 enc.set_property_from_str("rc-mode", "cbr-ld-hq");
@@ -850,15 +858,15 @@ fn configure_payloader(pay: &gst::Element) {
 
 fn setup_signal_accumulator(
     _hint: &glib::subclass::SignalInvocationHint,
-    ret: &mut glib::Value,
+    _acc: glib::Value,
     value: &glib::Value,
-) -> bool {
+) -> std::ops::ControlFlow<glib::Value, glib::Value> {
     let is_configured = value.get::<bool>().unwrap();
-    let continue_emission = !is_configured;
-
-    *ret = value.clone();
-
-    continue_emission
+    if !is_configured {
+        std::ops::ControlFlow::Continue(value.clone())
+    } else {
+        std::ops::ControlFlow::Break(value.clone())
+    }
 }
 
 /// Set of elements used in an EncodingChain
@@ -1028,7 +1036,9 @@ impl VideoEncoder {
             "vp8enc"
                 | "vp9enc"
                 | "x264enc"
+                | "openh264enc"
                 | "nvh264enc"
+                | "nvh265enc"
                 | "vaapih264enc"
                 | "vaapivp8enc"
                 | "qsvh264enc"
@@ -1047,11 +1057,12 @@ impl VideoEncoder {
         let bitrate = match self.factory_name.as_str() {
             "vp8enc" | "vp9enc" => self.element.property::<i32>("target-bitrate"),
             "av1enc" => (self.element.property::<u32>("target-bitrate") * 1000) as i32,
-            "x264enc" | "nvh264enc" | "vaapih264enc" | "vaapivp8enc" | "qsvh264enc"
-            | "nvav1enc" | "vpuenc_h264" => (self.element.property::<u32>("bitrate") * 1000) as i32,
-            "nvv4l2h264enc" | "nvv4l2vp8enc" | "nvv4l2vp9enc" | "rav1enc" | "nvv4l2av1enc" => {
-                (self.element.property::<u32>("bitrate")) as i32
+            "x264enc" | "nvh264enc" | "nvh265enc" | "vaapih264enc" | "vaapivp8enc"
+            | "qsvh264enc" | "nvav1enc" | "vpuenc_h264" => {
+                (self.element.property::<u32>("bitrate") * 1000) as i32
             }
+            "openh264enc" | "nvv4l2h264enc" | "nvv4l2vp8enc" | "nvv4l2vp9enc" | "rav1enc"
+            | "nvv4l2av1enc" => (self.element.property::<u32>("bitrate")) as i32,
             _ => return Err(WebRTCSinkError::BitrateNotSupported),
         };
 
@@ -1082,12 +1093,12 @@ impl VideoEncoder {
             "av1enc" => self
                 .element
                 .set_property("target-bitrate", (bitrate / 1000) as u32),
-            "x264enc" | "nvh264enc" | "vaapih264enc" | "vaapivp8enc" | "qsvh264enc"
-            | "nvav1enc" | "vpuenc_h264" => {
+            "x264enc" | "nvh264enc" | "nvh265enc" | "vaapih264enc" | "vaapivp8enc"
+            | "qsvh264enc" | "nvav1enc" | "vpuenc_h264" => {
                 self.element
                     .set_property("bitrate", (bitrate / 1000) as u32);
             }
-            "nvv4l2h264enc" | "nvv4l2vp8enc" | "nvv4l2vp9enc" | "nvv4l2av1enc" => {
+            "openh264enc" | "nvv4l2h264enc" | "nvv4l2vp8enc" | "nvv4l2vp9enc" | "nvv4l2av1enc" => {
                 self.element.set_property("bitrate", bitrate as u32)
             }
             "rav1enc" => self.element.set_property("bitrate", bitrate),
@@ -1280,6 +1291,8 @@ impl SessionInner {
             stats_sigid: None,
             codecs: None,
             stats_collection_handle: None,
+            navigation_handler: None,
+            control_events_handler: None,
         }
     }
 
@@ -1585,7 +1598,7 @@ impl NavigationEventHandler {
         let session_id = session_id.to_string();
 
         Self((
-            channel.connect_closure(
+            Some(channel.connect_closure(
                 "on-message-string",
                 false,
                 glib::closure!(
@@ -1597,9 +1610,16 @@ impl NavigationEventHandler {
                         create_navigation_event(element, msg, &session_id);
                     }
                 ),
-            ),
+            )),
             channel,
         ))
+    }
+}
+
+impl Drop for NavigationEventHandler {
+    fn drop(&mut self) {
+        self.0 .1.disconnect(self.0 .0.take().unwrap());
+        self.0 .1.close();
     }
 }
 
@@ -1618,7 +1638,7 @@ impl ControlRequestHandler {
         let session_id = session_id.to_string();
 
         Self((
-            channel.connect_closure(
+            Some(channel.connect_closure(
                 "on-message-string",
                 false,
                 glib::closure!(
@@ -1646,9 +1666,16 @@ impl ControlRequestHandler {
                         }
                     }
                 ),
-            ),
+            )),
             channel,
         ))
+    }
+}
+
+impl Drop for ControlRequestHandler {
+    fn drop(&mut self) {
+        self.0 .1.disconnect(self.0 .0.take().unwrap());
+        self.0 .1.close();
     }
 }
 
@@ -1744,7 +1771,7 @@ impl BaseWebRTCSink {
         match extension_configuration_type {
             ExtensionConfigurationType::Auto => {
                 // GstRTPBasePayload::extensions property is only available since GStreamer 1.24
-                if !payloader.has_property("extensions", Some(gst::Array::static_type())) {
+                if !payloader.has_property_with_type("extensions", gst::Array::static_type()) {
                     if self.has_connected_payloader_setup_slots() {
                         gst::warning!(CAT, imp = self, "'extensions' property is not available: TWCC extension ID will default to 1. \
         Application code must ensure to pick non-conflicting IDs for any additionally configured extensions. \
@@ -2179,13 +2206,19 @@ impl BaseWebRTCSink {
         drop(settings);
         let mut state = self.state.lock().unwrap();
 
+        let mut join_handles = vec![];
+
         #[cfg(feature = "web_server")]
         if let Some(web_shutdown_tx) = state.web_shutdown_tx.take() {
             let _ = web_shutdown_tx.send(());
             let web_join_handle = state.web_join_handle.take().expect("no web join handle");
-            RUNTIME.block_on(async {
-                let _ = web_join_handle.await;
-            });
+            // wait for this later
+            join_handles.push(
+                async {
+                    let _ = web_join_handle.await;
+                }
+                .boxed_local(),
+            );
         }
 
         let session_ids: Vec<_> = state.sessions.keys().map(|k| k.to_owned()).collect();
@@ -2208,9 +2241,12 @@ impl BaseWebRTCSink {
         gst::debug!(CAT, imp = self, "Waiting for codec discoveries to finish");
         let codecs_done_receiver = std::mem::take(&mut state.codecs_done_receivers);
         codecs_done_receiver.into_iter().for_each(|receiver| {
-            RUNTIME.block_on(async {
-                let _ = receiver.await;
-            });
+            join_handles.push(
+                async {
+                    let _ = receiver.await;
+                }
+                .boxed_local(),
+            );
         });
         gst::debug!(CAT, imp = self, "No codec discovery is running anymore");
 
@@ -2223,6 +2259,14 @@ impl BaseWebRTCSink {
         }
 
         drop(state);
+
+        // only wait for all handles after the state lock has been dropped.  Some of the futures may
+        // be waiting on the state lock to make forward progress before being able to be cancelled
+        // from calls above.
+        for handle in join_handles {
+            RUNTIME.block_on(handle);
+        }
+
         gst::debug!(CAT, imp = self, "Ending sessions");
         for session in sessions {
             signaller.end_session(&session.0.lock().unwrap().id);
@@ -2372,7 +2416,7 @@ impl BaseWebRTCSink {
             drop(state);
 
             let maybe_munged_offer = if signaller
-                .has_property("manual-sdp-munging", Some(bool::static_type()))
+                .has_property_with_type("manual-sdp-munging", bool::static_type())
                 && signaller.property("manual-sdp-munging")
             {
                 // Don't munge, signaller will manage this
@@ -2390,7 +2434,9 @@ impl BaseWebRTCSink {
         let signaller = settings.signaller.clone();
         drop(settings);
 
-        if let Some(session) = self.state.lock().unwrap().sessions.get(session_id).cloned() {
+        let session = self.state.lock().unwrap().sessions.get(session_id).cloned();
+
+        if let Some(session) = session {
             let mut session = session.0.lock().unwrap();
             let sdp = answer.sdp();
 
@@ -2408,7 +2454,7 @@ impl BaseWebRTCSink {
                 .emit_by_name::<()>("set-local-description", &[&answer, &None::<gst::Promise>]);
 
             let maybe_munged_answer = if signaller
-                .has_property("manual-sdp-munging", Some(bool::static_type()))
+                .has_property_with_type("manual-sdp-munging", bool::static_type())
                 && signaller.property("manual-sdp-munging")
             {
                 // Don't munge, signaller will manage this
@@ -2733,7 +2779,12 @@ impl BaseWebRTCSink {
             return;
         };
 
-        if let Some(ref handler) = state.control_events_handler {
+        let Some(session) = state.sessions.get(session_id) else {
+            return;
+        };
+        let session = session.0.lock().unwrap();
+
+        if let Some(ref handler) = session.control_events_handler {
             for meta in utils::serialize_meta(buffer, &settings.forward_metas) {
                 match serde_json::to_string(&utils::InfoMessage {
                     mid: mid.to_owned(),
@@ -2867,8 +2918,8 @@ impl BaseWebRTCSink {
                         #[strong]
                         session_id,
                         move |_webrtcbin: gst::Element, _bin: gst::Bin, e: gst::Element| {
-                            if e.factory().map_or(false, |f| f.name() == "rtprtxsend") {
-                                if e.has_property("stuffing-kbps", Some(i32::static_type())) {
+                            if e.factory().is_some_and(|f| f.name() == "rtprtxsend") {
+                                if e.has_property_with_type("stuffing-kbps", i32::static_type()) {
                                     element.imp().set_rtptrxsend(&session_id, e);
                                 } else {
                                     gst::warning!(
@@ -2896,7 +2947,7 @@ impl BaseWebRTCSink {
                 #[watch]
                 element,
                 move |_webrtcbin: gst::Element, _bin: gst::Bin, e: gst::Element| {
-                    if e.factory().map_or(false, |f| f.name() == "nicesink") {
+                    if e.factory().is_some_and(|f| f.name() == "nicesink") {
                         let sinkpad = e.static_pad("sink").unwrap();
 
                         let session_id = session_id.clone();
@@ -3341,20 +3392,26 @@ impl BaseWebRTCSink {
 
                 if enable_data_channel_navigation {
                     let mut state = this.state.lock().unwrap();
-                    state.navigation_handler = Some(NavigationEventHandler::new(
-                        &element,
-                        &webrtcbin,
-                        &session_id,
-                    ));
+                    if let Some(session) = state.sessions.get_mut(&session_id) {
+                        let mut session = session.0.lock().unwrap();
+                        session.navigation_handler = Some(NavigationEventHandler::new(
+                            &element,
+                            &webrtcbin,
+                            &session_id,
+                        ));
+                    }
                 }
 
                 if enable_control_data_channel {
                     let mut state = this.state.lock().unwrap();
-                    state.control_events_handler = Some(ControlRequestHandler::new(
-                        &element,
-                        &webrtcbin,
-                        &session_id,
-                    ));
+                    if let Some(session) = state.sessions.get_mut(&session_id) {
+                        let mut session = session.0.lock().unwrap();
+                        session.control_events_handler = Some(ControlRequestHandler::new(
+                            &element,
+                            &webrtcbin,
+                            &session_id,
+                        ));
+                    }
                 }
 
                 // This is intentionally emitted with the pipeline in the Ready state,
@@ -4068,11 +4125,30 @@ impl BaseWebRTCSink {
         // a renegotiation.
         let caps_type = current.name();
         if caps_type.starts_with("video/") {
-            const VIDEO_ALLOWED_CHANGES: &[&str] =
-                &["width", "height", "framerate", "pixel-aspect-ratio"];
+            const VIDEO_ALLOWED_CHANGES: &[&str] = &[
+                "width",
+                "height",
+                "framerate",
+                "pixel-aspect-ratio",
+                "colorimetry",
+                "chroma-site",
+            ];
 
             current.remove_fields(VIDEO_ALLOWED_CHANGES.iter().copied());
             new.remove_fields(VIDEO_ALLOWED_CHANGES.iter().copied());
+
+            // Multiview can be part of SDP, but missing field should be treated the same as mono view.
+            fn remove_multiview(s: &mut gst::Structure) {
+                let is_mono = match s.get::<VideoMultiviewMode>("multiview-mode") {
+                    Ok(mode) => mode == VideoMultiviewMode::Mono,
+                    Err(_) => true,
+                };
+                if is_mono {
+                    s.remove_fields(["multiview-mode", "multiview-flags"])
+                }
+            }
+            remove_multiview(&mut current);
+            remove_multiview(&mut new);
         } else if caps_type.starts_with("audio/") {
             // TODO
         }
@@ -4847,7 +4923,7 @@ impl ObjectImpl for BaseWebRTCSink {
                  */
                 glib::subclass::Signal::builder("get-sessions")
                     .action()
-                    .class_handler(|_, args| {
+                    .class_handler(|args| {
                         let element = args[0].get::<super::BaseWebRTCSink>().expect("signal arg");
                         let this = element.imp();
 
@@ -4885,7 +4961,7 @@ impl ObjectImpl for BaseWebRTCSink {
                     ])
                     .return_type::<bool>()
                     .accumulator(setup_signal_accumulator)
-                    .class_handler(|_, args| {
+                    .class_handler(|args| {
                         let element = args[0].get::<super::BaseWebRTCSink>().expect("signal arg");
                         let enc = args[3].get::<gst::Element>().unwrap();
 
@@ -4930,7 +5006,7 @@ impl ObjectImpl for BaseWebRTCSink {
                     ])
                     .return_type::<bool>()
                     .accumulator(setup_signal_accumulator)
-                    .class_handler(|_, args| {
+                    .class_handler(|args| {
                         let pay = args[3].get::<gst::Element>().unwrap();
 
                         configure_payloader(&pay);
@@ -4997,12 +5073,12 @@ impl ObjectImpl for BaseWebRTCSink {
                     ])
                     .return_type::<gst::Structure>()
                     .run_last()
-                    .class_handler(|_token, args| {
+                    .class_handler(|args| {
                         Some(args[3usize].get::<gst::Structure>().expect("wrong argument").to_value())
                     })
-                    .accumulator(move |_hint, output, input| {
-                        *output = input.clone();
-                        false
+                    .accumulator(move |_hint, _acc, value| {
+                        // First signal handler wins
+                        std::ops::ControlFlow::Break(value.clone())
                     })
                     .build(),
             ]
@@ -5400,6 +5476,31 @@ impl WebRTCSink {
         let settings = self.settings.lock().unwrap().clone();
 
         if settings.run_signalling_server {
+            // Configure our own signalling server as URI on the signaller
+            {
+                let signaller = self
+                    .obj()
+                    .upcast_ref::<super::BaseWebRTCSink>()
+                    .imp()
+                    .settings
+                    .lock()
+                    .unwrap()
+                    .signaller
+                    .clone();
+
+                // Map UNSPECIFIED addresses to localhost
+                let host = match settings.signalling_server_host.as_str() {
+                    "0.0.0.0" => "127.0.0.1".to_string(),
+                    "::" | "[::]" => "[::1]".to_string(),
+                    host => host.to_string(),
+                };
+
+                signaller.set_property(
+                    "uri",
+                    format!("ws://{}:{}", host, settings.signalling_server_port),
+                );
+            }
+
             if let Err(err) = LazyLock::force(&SIGNALLING_LOGGING) {
                 Err(anyhow!(
                     "failed signalling server logging initialization: {}",
@@ -5645,6 +5746,8 @@ pub(super) mod aws {
 
     impl ObjectImpl for AwsKvsWebRTCSink {
         fn constructed(&self) {
+            self.parent_constructed();
+
             let element = self.obj();
             let ws = element
                 .upcast_ref::<crate::webrtcsink::BaseWebRTCSink>()
@@ -5694,6 +5797,8 @@ pub(super) mod whip {
 
     impl ObjectImpl for WhipWebRTCSink {
         fn constructed(&self) {
+            self.parent_constructed();
+
             let element = self.obj();
             let ws = element
                 .upcast_ref::<crate::webrtcsink::BaseWebRTCSink>()
@@ -5743,6 +5848,8 @@ pub(super) mod livekit {
 
     impl ObjectImpl for LiveKitWebRTCSink {
         fn constructed(&self) {
+            self.parent_constructed();
+
             let element = self.obj();
             let ws = element
                 .upcast_ref::<crate::webrtcsink::BaseWebRTCSink>()
@@ -5835,6 +5942,8 @@ pub(super) mod janus {
     #[glib::derived_properties]
     impl ObjectImpl for JanusVRWebRTCSink {
         fn constructed(&self) {
+            self.parent_constructed();
+
             let settings = self.settings.lock().unwrap();
             let element = self.obj();
             let ws = element

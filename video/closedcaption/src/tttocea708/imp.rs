@@ -60,7 +60,6 @@ impl Default for Settings {
 struct State {
     translator: TextToCea708,
     framerate: gst::Fraction,
-    last_frame_no: u64,
     max_frame_no: u64,
     force_clear: bool,
 }
@@ -70,7 +69,6 @@ impl Default for State {
         Self {
             translator: TextToCea708::default(),
             framerate: gst::Fraction::new(DEFAULT_FPS_N, DEFAULT_FPS_D),
-            last_frame_no: 0,
             max_frame_no: 0,
             force_clear: false,
         }
@@ -85,9 +83,16 @@ static CAT: LazyLock<gst::DebugCategory> = LazyLock::new(|| {
     )
 });
 
-fn cc_data_buffer(data: &[u8], pts: gst::ClockTime, duration: gst::ClockTime) -> gst::Buffer {
+fn cc_data_buffer(
+    imp: &TtToCea708,
+    data: &[u8],
+    pts: gst::ClockTime,
+    duration: gst::ClockTime,
+) -> gst::Buffer {
     let mut ret = gst::Buffer::with_size(data.len()).unwrap();
     let buf_mut = ret.get_mut().unwrap();
+
+    gst::log!(CAT, imp = imp, "{pts} -> {}: {data:x?}", pts + duration);
 
     buf_mut.copy_from_slice(0, data).unwrap();
     buf_mut.set_pts(pts);
@@ -147,7 +152,7 @@ impl TtToCea708 {
                 .mul_div_round(fps_d * gst::ClockTime::SECOND.nseconds(), fps_n)
                 .unwrap()
                 .nseconds();
-            mut_list.add(cc_data_buffer(&cea708.packet, pts, duration));
+            mut_list.add(cc_data_buffer(self, &cea708.packet, pts, duration));
         }
         bufferlist
     }
@@ -288,34 +293,14 @@ impl TtToCea708 {
             EventView::Gap(e) => {
                 let mut state = self.state.lock().unwrap();
 
-                let (fps_n, fps_d) = (
-                    state.framerate.numer() as u64,
-                    state.framerate.denom() as u64,
-                );
-
                 let (timestamp, duration) = e.get();
 
-                if state.last_frame_no == 0 {
-                    state.last_frame_no = timestamp.mul_div_floor(fps_n, fps_d).unwrap().seconds();
-
-                    gst::debug!(
-                        CAT,
-                        imp = self,
-                        "Initial skip to frame no {}",
-                        state.last_frame_no
-                    );
-                }
-
-                let frame_no = (timestamp + duration.unwrap_or(gst::ClockTime::ZERO))
-                    .mul_div_round(fps_n, fps_d)
-                    .unwrap()
-                    .seconds();
-                state.max_frame_no = frame_no;
-
-                let last_frame_no = state.last_frame_no;
-                state
-                    .translator
-                    .generate(last_frame_no, frame_no, Lines::new_empty());
+                self.generate(
+                    &mut state,
+                    timestamp,
+                    duration.unwrap_or(gst::ClockTime::ZERO),
+                    Lines::new_empty(),
+                );
                 let bufferlist = self.pop_bufferlist(&mut state);
 
                 drop(state);

@@ -242,7 +242,7 @@ impl RaptorqDec {
             let blocksz = info.symbols_per_block * symbolsz;
 
             let config = ObjectTransmissionInformation::new(0, symbolsz as u16, 1, 1, 8);
-            let mut decoder = SourceBlockDecoder::new2(0, &config, blocksz);
+            let mut decoder = SourceBlockDecoder::new(0, &config, blocksz);
             let mut result = None;
 
             for (esi, symbol) in
@@ -822,7 +822,7 @@ impl ElementImpl for RaptorqDec {
         }
 
         let sinkpad_fec = gst::Pad::builder_from_template(templ)
-            .maybe_name(name)
+            .name_if_some(name)
             .chain_function(|pad, parent, buffer| {
                 Self::catch_panic_pad_function(
                     parent,

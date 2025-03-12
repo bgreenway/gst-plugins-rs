@@ -21,7 +21,7 @@ use std::sync::Mutex;
 
 use std::sync::LazyLock;
 
-use super::{AwsPollyEngine, AwsPollyLanguageCode, AwsPollyVoiceId, CAT};
+use super::{AwsOverflow, AwsPollyEngine, AwsPollyLanguageCode, AwsPollyVoiceId, CAT};
 use crate::s3utils::RUNTIME;
 use anyhow::{anyhow, Error};
 
@@ -34,6 +34,8 @@ const DEFAULT_LATENCY: gst::ClockTime = gst::ClockTime::from_seconds(2);
 const DEFAULT_ENGINE: AwsPollyEngine = AwsPollyEngine::Neural;
 const DEFAULT_LANGUAGE_CODE: AwsPollyLanguageCode = AwsPollyLanguageCode::None;
 const DEFAULT_VOICE_ID: AwsPollyVoiceId = AwsPollyVoiceId::Aria;
+const DEFAULT_SSML_SET_MAX_DURATION: bool = false;
+const DEFAULT_OVERFLOW: AwsOverflow = AwsOverflow::Clip;
 
 #[derive(Debug, Clone)]
 pub(super) struct Settings {
@@ -45,6 +47,8 @@ pub(super) struct Settings {
     language_code: AwsPollyLanguageCode,
     voice_id: AwsPollyVoiceId,
     lexicon_names: gst::Array,
+    ssml_set_max_duration: bool,
+    overflow: AwsOverflow,
 }
 
 impl Default for Settings {
@@ -58,6 +62,8 @@ impl Default for Settings {
             language_code: DEFAULT_LANGUAGE_CODE,
             voice_id: DEFAULT_VOICE_ID,
             lexicon_names: gst::Array::default(),
+            ssml_set_max_duration: DEFAULT_SSML_SET_MAX_DURATION,
+            overflow: DEFAULT_OVERFLOW,
         }
     }
 }
@@ -112,8 +118,7 @@ impl Polly {
                     }
                     Ok(segment) => segment,
                 };
-                let mut state = self.state.lock().unwrap();
-                state.out_segment = segment;
+                self.state.lock().unwrap().out_segment = segment;
                 gst::Pad::event_default(pad, Some(&*self.obj()), event)
             }
             Caps(c) => {
@@ -155,7 +160,7 @@ impl Polly {
     }
 
     async fn send(&self, inbuf: gst::Buffer) -> Result<gst::Buffer, Error> {
-        let pts = inbuf
+        let mut pts = inbuf
             .pts()
             .ok_or_else(|| anyhow!("Stream with timestamped buffers required"))?;
 
@@ -181,13 +186,23 @@ impl Polly {
 
         let job = {
             let settings = self.settings.lock().unwrap();
-
             let mut task = client
                 .synthesize_speech()
                 .engine(settings.engine.into())
                 .output_format(aws_sdk_polly::types::OutputFormat::Pcm)
-                .text_type(in_format)
-                .text(data)
+                .text_type(if settings.ssml_set_max_duration {
+                    aws_sdk_polly::types::TextType::Ssml
+                } else {
+                    in_format
+                })
+                .text(if settings.ssml_set_max_duration {
+                    format!(
+                        "<speak><prosody amazon:max-duration=\"{}ms\">{data}</prosody></speak>",
+                        duration.mseconds()
+                    )
+                } else {
+                    data.to_owned()
+                })
                 .voice_id(settings.voice_id.into())
                 .set_lexicon_names(Some(
                     settings
@@ -214,8 +229,46 @@ impl Polly {
         })?;
         let blob = resp.audio_stream.collect().await?;
 
-        let mut buf = gst::Buffer::from_slice(blob.into_bytes());
+        let mut bytes = blob.into_bytes();
+
+        let overflow = self.settings.lock().unwrap().overflow;
+
+        if matches!(overflow, AwsOverflow::Clip) {
+            let max_expected_bytes = duration
+                .nseconds()
+                .mul_div_floor(32_000, 1_000_000_000)
+                .unwrap()
+                / 2
+                * 2;
+
+            gst::debug!(
+                CAT,
+                "Received {} bytes, max expected {}",
+                bytes.len(),
+                max_expected_bytes
+            );
+
+            bytes.truncate(max_expected_bytes as usize);
+        }
+
+        let duration = gst::ClockTime::from_nseconds(
+            (bytes.len() as u64)
+                .mul_div_round(1_000_000_000, 32_000)
+                .unwrap(),
+        );
+
+        let mut buf = gst::Buffer::from_slice(bytes);
         let mut state = self.state.lock().unwrap();
+
+        if let Some(position) = state.out_segment.position() {
+            if matches!(overflow, AwsOverflow::Shift) && pts < position {
+                gst::debug!(
+                    CAT,
+                    "received pts {pts} < position {position}, shifting forward"
+                );
+                pts = position;
+            }
+        }
 
         let discont = state
             .out_segment
@@ -229,7 +282,7 @@ impl Polly {
             buf_mut.set_duration(duration);
 
             if discont {
-                gst::log!(CAT, imp = self, "Marking buffer discont");
+                gst::debug!(CAT, imp = self, "Marking buffer discont");
                 buf_mut.set_flags(gst::BufferFlags::DISCONT);
             }
             inbuf.foreach_meta(|meta| {
@@ -496,6 +549,17 @@ impl ObjectImpl for Polly {
                     )
                     .mutable_ready()
                     .build(),
+                glib::ParamSpecBoolean::builder("ssml-set-max-duration")
+                    .nick("SSML set max duration")
+                    .blurb("Wrap plain text as SSML and set the max-duration attribute")
+                    .default_value(DEFAULT_SSML_SET_MAX_DURATION)
+                    .mutable_ready()
+                    .build(),
+                glib::ParamSpecEnum::builder_with_default("overflow", DEFAULT_OVERFLOW)
+                    .nick("Overflow")
+                    .blurb("Defines how output audio with a longer duration than input text should be handled")
+                    .mutable_ready()
+                    .build(),
             ]
         });
 
@@ -552,6 +616,14 @@ impl ObjectImpl for Polly {
                 let mut settings = self.settings.lock().unwrap();
                 settings.lexicon_names = value.get::<gst::Array>().expect("type checked upstream");
             }
+            "ssml-set-max-duration" => {
+                let mut settings = self.settings.lock().unwrap();
+                settings.ssml_set_max_duration = value.get().expect("type checked upstream");
+            }
+            "overflow" => {
+                let mut settings = self.settings.lock().unwrap();
+                settings.overflow = value.get::<AwsOverflow>().expect("type checked upstream");
+            }
             _ => unimplemented!(),
         }
     }
@@ -589,6 +661,14 @@ impl ObjectImpl for Polly {
             "lexicon-names" => {
                 let settings = self.settings.lock().unwrap();
                 settings.lexicon_names.to_value()
+            }
+            "ssml-set-max-duration" => {
+                let settings = self.settings.lock().unwrap();
+                settings.ssml_set_max_duration.to_value()
+            }
+            "overflow" => {
+                let settings = self.settings.lock().unwrap();
+                settings.overflow.to_value()
             }
             _ => unimplemented!(),
         }
