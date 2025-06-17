@@ -1043,7 +1043,7 @@ impl FallbackSrc {
     fn create_dummy_video_source(filter_caps: &gst::Caps, _min_latency: gst::ClockTime) -> gst::Bin {
         let bin = gst::Bin::default();
 
-        let videotestsrc = gst::ElementFactory::make("nvvideotestsrc")
+        let videotestsrc = gst::ElementFactory::make("videotestsrc")
             .name("videosrc")
             .property_from_str("pattern", "gradient")
             .property_from_str("animation-mode", "running-time")
