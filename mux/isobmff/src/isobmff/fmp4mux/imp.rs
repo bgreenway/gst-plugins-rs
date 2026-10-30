@@ -5450,6 +5450,11 @@ impl ElementImpl for ISOFMP4Mux {
             ]
             .into_iter()
             .collect::<gst::Caps>();
+            sink_caps.merge(
+                gst::Caps::builder("application/x-onvif-metadata")
+                    .field("parsed", true)
+                    .build(),
+            );
             sink_caps.merge(crate::isobmff::supported_uncompressed_caps());
 
             let sink_pad_template = gst::PadTemplate::with_gtype(

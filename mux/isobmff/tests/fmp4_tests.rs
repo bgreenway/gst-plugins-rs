@@ -11,7 +11,12 @@ use gst::prelude::*;
 use mp4_atom::{Atom, ReadAtom as _, ReadFrom as _};
 use tempfile::tempdir;
 
-use std::{fs::File, path::Path, thread};
+use std::{
+    fs::File,
+    path::Path,
+    sync::{Arc, Mutex},
+    thread,
+};
 
 pub mod support;
 use support::{ExpectedConfiguration, check_ftyp_output, check_mvhd_sanity};
@@ -470,6 +475,274 @@ fn test_buffer_flags_multi_stream() {
     assert_eq!(ev.type_(), gst::EventType::Segment);
     let ev = h1.pull_event().unwrap();
     assert_eq!(ev.type_(), gst::EventType::Eos);
+}
+
+const ONVIF_NAMESPACE: &str = "http://www.onvif.org/ver10/schema";
+const APPLICATION_NAMESPACE: &str = "urn:example:timed-metadata:v1";
+const TIMED_METADATA_XML: &[u8] = br#"<tt:MetadataStream xmlns:tt="http://www.onvif.org/ver10/schema" xmlns:app="urn:example:timed-metadata:v1"><tt:SensorData/><app:Measurement value="21.5"/></tt:MetadataStream>"#;
+
+fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
+fn timed_metadata_video_caps(codec: &str) -> (gst::Caps, bool) {
+    match codec {
+        "h264" => (
+            gst::Caps::builder("video/x-h264")
+                .field("width", 1920i32)
+                .field("height", 1080i32)
+                .field("framerate", gst::Fraction::new(30, 1))
+                .field("stream-format", "avc")
+                .field("alignment", "au")
+                .field("codec_data", gst::Buffer::with_size(1).unwrap())
+                .build(),
+            true,
+        ),
+        "h265" => (
+            gst::Caps::builder("video/x-h265")
+                .field("width", 1920i32)
+                .field("height", 1080i32)
+                .field("framerate", gst::Fraction::new(30, 1))
+                .field("stream-format", "hvc1")
+                .field("alignment", "au")
+                .field("codec_data", gst::Buffer::with_size(1).unwrap())
+                .build(),
+            true,
+        ),
+        "av1" => (
+            gst::Caps::builder("video/x-av1")
+                .field("width", 1920i32)
+                .field("height", 1080i32)
+                .field("framerate", gst::Fraction::new(30, 1))
+                .field("stream-format", "obu-stream")
+                .field("alignment", "tu")
+                .field("profile", "main")
+                .field("tier", "main")
+                .field("level", "4.1")
+                .field("chroma-format", "4:2:0")
+                .field("bit-depth-luma", 8u32)
+                .field("bit-depth-chroma", 8u32)
+                .field("colorimetry", "bt709")
+                .build(),
+            false,
+        ),
+        _ => unreachable!(),
+    }
+}
+
+fn test_timed_onvif_metadata_generic_isofmp4mux(codec: &str) {
+    init();
+
+    let mut video = gst_check::Harness::with_padnames("isofmp4mux", Some("sink_0"), Some("src"));
+    let element = video.element().unwrap();
+    let mut audio = gst_check::Harness::with_element(&element, Some("sink_1"), None);
+    let mut metadata = gst_check::Harness::with_element(&element, Some("sink_2"), None);
+
+    element.set_property("fragment-duration", 5.seconds());
+
+    let (video_caps, video_needs_dts) = timed_metadata_video_caps(codec);
+    video.set_src_caps(video_caps);
+    video.play();
+
+    audio.set_src_caps(
+        gst::Caps::builder("audio/mpeg")
+            .field("mpegversion", 4i32)
+            .field("channels", 1i32)
+            .field("rate", 44100i32)
+            .field("stream-format", "raw")
+            .field("base-profile", "lc")
+            .field("profile", "lc")
+            .field("level", "2")
+            .field(
+                "codec_data",
+                gst::Buffer::from_slice([0x12, 0x08, 0x56, 0xe5, 0x00]),
+            )
+            .build(),
+    );
+    audio.play();
+
+    metadata.set_src_caps(
+        gst::Caps::builder("application/x-onvif-metadata")
+            .field("parsed", true)
+            .build(),
+    );
+    metadata.play();
+
+    // Two metadata intervals are deliberately gaps. This proves that a sparse metadata
+    // track does not stall otherwise continuous video and audio.
+    for i in 0..7 {
+        let mut buffer = gst::Buffer::from_slice([b'V']);
+        {
+            let buffer = buffer.get_mut().unwrap();
+            buffer.set_pts(i.seconds());
+            if video_needs_dts {
+                buffer.set_dts(i.seconds());
+            }
+            buffer.set_duration(gst::ClockTime::SECOND);
+            if i != 0 && i != 5 {
+                buffer.set_flags(gst::BufferFlags::DELTA_UNIT);
+            }
+        }
+        assert_eq!(video.push(buffer), Ok(gst::FlowSuccess::Ok));
+
+        let mut buffer = gst::Buffer::from_slice([b'A']);
+        {
+            let buffer = buffer.get_mut().unwrap();
+            buffer.set_pts(i.seconds());
+            buffer.set_duration(gst::ClockTime::SECOND);
+        }
+        assert_eq!(audio.push(buffer), Ok(gst::FlowSuccess::Ok));
+
+        if i == 3 || i == 6 {
+            assert!(
+                metadata.push_event(
+                    gst::event::Gap::builder(i.seconds())
+                        .duration(gst::ClockTime::SECOND)
+                        .build(),
+                )
+            );
+        } else {
+            let mut buffer = gst::Buffer::from_slice(TIMED_METADATA_XML.to_vec());
+            {
+                let buffer = buffer.get_mut().unwrap();
+                buffer.set_pts(i.seconds());
+                buffer.set_duration(gst::ClockTime::SECOND);
+            }
+            assert_eq!(metadata.push(buffer), Ok(gst::FlowSuccess::Ok));
+        }
+    }
+
+    video.crank_single_clock_wait().unwrap();
+
+    let header = video.pull().unwrap();
+    assert_eq!(
+        header.flags(),
+        gst::BufferFlags::HEADER | gst::BufferFlags::DISCONT
+    );
+    let header_map = header.map_readable().unwrap();
+    assert!(contains_subslice(header_map.as_slice(), b"metx"));
+    assert!(contains_subslice(
+        header_map.as_slice(),
+        ONVIF_NAMESPACE.as_bytes()
+    ));
+    assert!(!contains_subslice(
+        header_map.as_slice(),
+        APPLICATION_NAMESPACE.as_bytes()
+    ));
+
+    // sink_0 is video track 1. The metadata track must carry a cdsc reference to it for
+    // H.264, H.265 and AV1 alike.
+    let cdsc = header_map
+        .as_slice()
+        .windows(4)
+        .position(|window| window == b"cdsc")
+        .expect("metadata track has no cdsc reference");
+    assert_eq!(
+        &header_map.as_slice()[cdsc + 4..cdsc + 8],
+        &1u32.to_be_bytes()
+    );
+
+    let mut serialized_fragment = header_map.as_slice().to_vec();
+    drop(header_map);
+
+    let fragment_header = video.pull().unwrap();
+    assert_eq!(fragment_header.flags(), gst::BufferFlags::HEADER);
+    serialized_fragment.extend_from_slice(fragment_header.map_readable().unwrap().as_slice());
+
+    let mut found_metadata_payload = false;
+    let mut video_payloads = 0;
+    for _ in 0..14 {
+        let buffer = video.pull().unwrap();
+        let map = buffer.map_readable().unwrap();
+        found_metadata_payload |= map.as_slice() == TIMED_METADATA_XML;
+        video_payloads += usize::from(map.as_slice() == [b'V']);
+        serialized_fragment.extend_from_slice(map.as_slice());
+    }
+    assert!(found_metadata_payload);
+    assert_eq!(video_payloads, 5);
+
+    video.push_event(gst::event::Eos::new());
+    audio.push_event(gst::event::Eos::new());
+    metadata.push_event(gst::event::Eos::new());
+
+    // Verify the other half of the contract with the installed qtdemux: the mixed-namespace
+    // metx track must be recognized as ONVIF metadata and the XML sample must survive intact.
+    let dir = tempdir().unwrap();
+    let location = dir.path().join(format!("timed-metadata-{codec}.mp4"));
+    std::fs::write(&location, serialized_fragment).unwrap();
+
+    let pipeline = gst::parse::launch(
+        "filesrc name=src ! qtdemux name=demux \
+         demux.video_0 ! queue ! fakesink name=video-sink signal-handoffs=true sync=false \
+         demux.audio_0 ! queue ! fakesink sync=false \
+         demux.meta_0 ! queue ! fakesink name=metadata-sink signal-handoffs=true sync=false",
+    )
+    .unwrap()
+    .downcast::<gst::Pipeline>()
+    .unwrap();
+    pipeline
+        .by_name("src")
+        .unwrap()
+        .set_property("location", location.display().to_string());
+
+    let recovered_metadata = Arc::new(Mutex::new(Vec::new()));
+    let recovered_metadata_clone = recovered_metadata.clone();
+    pipeline
+        .by_name("metadata-sink")
+        .unwrap()
+        .connect("handoff", false, move |values| {
+            let buffer = values[1].get::<gst::Buffer>().unwrap();
+            let pad = values[2].get::<gst::Pad>().unwrap();
+            let caps = pad.current_caps().unwrap();
+            recovered_metadata_clone.lock().unwrap().push((
+                caps.structure(0).unwrap().name().to_string(),
+                buffer.map_readable().unwrap().as_slice().to_vec(),
+            ));
+            None
+        });
+
+    let recovered_video = Arc::new(Mutex::new(Vec::new()));
+    let recovered_video_clone = recovered_video.clone();
+    pipeline
+        .by_name("video-sink")
+        .unwrap()
+        .connect("handoff", false, move |values| {
+            let buffer = values[1].get::<gst::Buffer>().unwrap();
+            recovered_video_clone
+                .lock()
+                .unwrap()
+                .push(buffer.map_readable().unwrap().as_slice().to_vec());
+            None
+        });
+
+    to_completion(&pipeline);
+    let recovered_metadata = recovered_metadata.lock().unwrap();
+    assert!(recovered_metadata.iter().any(|(caps_name, payload)| {
+        caps_name == "application/x-onvif-metadata" && payload == TIMED_METADATA_XML
+    }));
+    let recovered_video = recovered_video.lock().unwrap();
+    assert_eq!(recovered_video.len(), 5);
+    assert!(
+        recovered_video.iter().all(|payload| payload == &[b'V']),
+        "unexpected demuxed {codec} samples: {recovered_video:?}"
+    );
+}
+
+#[test]
+fn test_timed_onvif_metadata_generic_isofmp4mux_h264_aac() {
+    test_timed_onvif_metadata_generic_isofmp4mux("h264");
+}
+
+#[test]
+fn test_timed_onvif_metadata_generic_isofmp4mux_h265_aac() {
+    test_timed_onvif_metadata_generic_isofmp4mux("h265");
+}
+
+#[test]
+fn test_timed_onvif_metadata_generic_isofmp4mux_av1_aac() {
+    test_timed_onvif_metadata_generic_isofmp4mux("av1");
 }
 
 #[test]

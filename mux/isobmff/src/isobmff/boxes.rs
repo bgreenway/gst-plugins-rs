@@ -166,9 +166,10 @@ fn write_moov(v: &mut Vec<u8>, cfg: &PresentationConfiguration) -> Result<(), Er
         write_box(v, b"trak", |v| {
             let mut references = Vec::new();
 
-            // Reference the video track for ONVIF metadata tracks
+            // Reference the video track for ONVIF metadata tracks. Timed ONVIF XML is also
+            // supported by the generic ISO variants, and the relationship is independent of
+            // the muxer variant.
             if let Some(first_video_track_idx) = first_video_track_idx
-                && (cfg.variant == Variant::FragmentedONVIF || cfg.variant == Variant::ONVIF)
                 && stream.is_onvif_metadata()
             {
                 references.push(TrackReference {
